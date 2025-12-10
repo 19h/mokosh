@@ -14,6 +14,9 @@
 //! ## Categorical Encoders
 //! - [`CategoryEncoder`]: Encodes discrete categories into non-overlapping patterns
 //! - [`BooleanEncoder`]: Encodes true/false values
+//! - [`HierarchicalCategoryEncoder`]: Encodes categories in a taxonomy with parent-child sharing
+//! - [`OrdinalEncoder`]: Encodes ordered categories with adjacency overlap
+//! - [`SetEncoder`]: Encodes variable-size sets of items
 //!
 //! ## Temporal Encoders
 //! - [`DateEncoder`]: Encodes date/time values with multiple configurable attributes
@@ -25,6 +28,38 @@
 //!
 //! ## Text Encoders
 //! - [`SimHashDocumentEncoder`]: Encodes documents/text with similarity preservation
+//! - [`WordEmbeddingEncoder`]: Converts dense word vectors (word2vec/GloVe) to SDRs
+//! - [`CharacterEncoder`]: Character-level encoding with optional semantic similarity
+//! - [`NGramEncoder`]: Encodes character or word n-grams
+//!
+//! ## Audio Encoders
+//! - [`SpectrogramEncoder`]: Encodes audio frequency spectra (FFT/mel)
+//! - [`WaveformEncoder`]: Encodes raw audio samples
+//! - [`PitchEncoder`]: Encodes musical pitch with octave and pitch class
+//!
+//! ## Vision Encoders
+//! - [`PatchEncoder`]: Encodes image patches using random projections
+//! - [`ColorEncoder`]: Encodes colors in HSV space
+//! - [`EdgeOrientationEncoder`]: Encodes oriented edge features
+//!
+//! ## Network Encoders
+//! - [`IpAddressEncoder`]: Encodes IPv4/IPv6 addresses with subnet awareness
+//! - [`MacAddressEncoder`]: Encodes MAC addresses with OUI (vendor) awareness
+//! - [`GraphNodeEncoder`]: Encodes graph node embeddings
+//!
+//! ## Biometric Encoders
+//! - [`HrvEncoder`]: Encodes heart rate variability metrics
+//! - [`EcgEncoder`]: Encodes ECG waveforms
+//! - [`AccelerometerEncoder`]: Encodes 3-axis accelerometer data
+//!
+//! ## Financial Encoders
+//! - [`PriceEncoder`]: Encodes financial prices with log-scale support
+//! - [`CurrencyPairEncoder`]: Encodes forex currency pairs
+//! - [`OrderBookEncoder`]: Encodes order book depth snapshots
+//!
+//! ## Probabilistic Encoders
+//! - [`DistributionEncoder`]: Encodes probability distributions
+//! - [`ConfidenceIntervalEncoder`]: Encodes values with uncertainty ranges
 //!
 //! ## Composite Encoders
 //! - [`MultiEncoder`]: Combines multiple encoders for the same input type
@@ -63,6 +98,45 @@ mod rdse;
 mod scalar;
 mod simhash;
 
+// Audio encoders
+mod spectrogram;
+mod waveform;
+mod pitch;
+
+// Text/NLP encoders
+mod word_embedding;
+mod character;
+mod ngram;
+
+// Vision encoders
+mod patch;
+mod color;
+mod edge_orientation;
+
+// Network encoders
+mod ip_address;
+mod mac_address;
+mod graph_node;
+
+// Biometric encoders
+mod hrv;
+mod ecg;
+mod accelerometer;
+
+// Categorical encoders
+mod hierarchical_category;
+mod ordinal;
+mod set;
+
+// Financial encoders
+mod price;
+mod currency_pair;
+mod order_book;
+
+// Probabilistic encoders
+mod distribution;
+mod confidence_interval;
+
 pub use base::Encoder;
 pub use boolean::{BooleanEncoder, BooleanEncoderParams};
 pub use category::{CategoryEncoder, CategoryEncoderParams};
@@ -77,3 +151,42 @@ pub use passthrough::{PassThroughEncoder, PassThroughEncoderParams};
 pub use rdse::{RandomDistributedScalarEncoder, Rdse, RdseParams};
 pub use scalar::{ScalarEncoder, ScalarEncoderParams};
 pub use simhash::{SimHashDocumentEncoder, SimHashDocumentEncoderParams};
+
+// Audio encoders
+pub use spectrogram::{SpectrogramEncoder, SpectrogramEncoderParams};
+pub use waveform::{WaveformEncoder, WaveformEncoderParams};
+pub use pitch::{PitchEncoder, PitchEncoderParams, Pitch};
+
+// Text/NLP encoders
+pub use word_embedding::{WordEmbeddingEncoder, WordEmbeddingEncoderParams};
+pub use character::{CharacterEncoder, CharacterEncoderParams};
+pub use ngram::{NGramEncoder, NGramEncoderParams};
+
+// Vision encoders
+pub use patch::{PatchEncoder, PatchEncoderParams, ImagePatch};
+pub use color::{ColorEncoder, ColorEncoderParams, HsvColor, RgbColor};
+pub use edge_orientation::{EdgeOrientationEncoder, EdgeOrientationEncoderParams, OrientedEdge};
+
+// Network encoders
+pub use ip_address::{IpAddressEncoder, IpAddressEncoderParams};
+pub use mac_address::{MacAddressEncoder, MacAddressEncoderParams, MacAddress};
+pub use graph_node::{GraphNodeEncoder, GraphNodeEncoderParams, GraphNode};
+
+// Biometric encoders
+pub use hrv::{HrvEncoder, HrvEncoderParams, HrvMetrics};
+pub use ecg::{EcgEncoder, EcgEncoderParams, EcgStats};
+pub use accelerometer::{AccelerometerEncoder, AccelerometerEncoderParams, AccelerometerReading};
+
+// Categorical encoders
+pub use hierarchical_category::{HierarchicalCategoryEncoder, HierarchicalCategoryEncoderParams};
+pub use ordinal::{OrdinalEncoder, OrdinalEncoderParams};
+pub use set::{SetEncoder, SetEncoderParams};
+
+// Financial encoders
+pub use price::{PriceEncoder, PriceEncoderParams, PriceData};
+pub use currency_pair::{CurrencyPairEncoder, CurrencyPairEncoderParams, CurrencyPair};
+pub use order_book::{OrderBookEncoder, OrderBookEncoderParams, OrderBook, PriceLevel};
+
+// Probabilistic encoders
+pub use distribution::{DistributionEncoder, DistributionEncoderParams, Distribution};
+pub use confidence_interval::{ConfidenceIntervalEncoder, ConfidenceIntervalEncoderParams, ConfidenceInterval};
