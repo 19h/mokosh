@@ -7,9 +7,9 @@
 use crate::algorithms::{Connections, ConnectionsParams};
 use crate::error::{MokoshError, Result};
 use crate::types::{
-    CellIdx, Permanence, Real, Sdr, Segment, SynapseIdx, UInt, MAX_PERMANENCE, MIN_PERMANENCE,
+    CellIdx, Permanence, Real, Sdr, SynapseIdx, UInt, MAX_PERMANENCE, MIN_PERMANENCE,
 };
-use crate::utils::{Neighborhood, Random, Topology, WrappingMode};
+use crate::utils::{simd, Neighborhood, Random, Topology, WrappingMode};
 
 #[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
@@ -542,28 +542,24 @@ impl SpatialPooler {
         }
     }
 
-    /// Updates duty cycles.
+    /// Updates duty cycles using SIMD-accelerated operations.
     fn update_duty_cycles(&mut self, overlaps: &[SynapseIdx], active: &Sdr) {
         let period = self.duty_cycle_period as Real;
 
-        // Update overlap duty cycles
-        for (i, &overlap) in overlaps.iter().enumerate() {
-            let value = if overlap > 0 { 1.0 } else { 0.0 };
-            self.overlap_duty_cycles[i] =
-                ((period - 1.0) * self.overlap_duty_cycles[i] + value) / period;
-        }
+        // Update overlap duty cycles using SIMD
+        simd::update_duty_cycles_from_overlaps(&mut self.overlap_duty_cycles, overlaps, period);
 
         // Update active duty cycles
-        let active_set: std::collections::HashSet<u32> = active.get_sparse().into_iter().collect();
-        for i in 0..self.num_columns {
-            let value = if active_set.contains(&(i as u32)) {
-                1.0
-            } else {
-                0.0
-            };
-            self.active_duty_cycles[i] =
-                ((period - 1.0) * self.active_duty_cycles[i] + value) / period;
+        // Build values array: 1.0 for active columns, 0.0 for inactive
+        let active_sparse = active.get_sparse();
+        let mut values = vec![0.0f32; self.num_columns];
+        for &col in &active_sparse {
+            if (col as usize) < self.num_columns {
+                values[col as usize] = 1.0;
+            }
         }
+
+        simd::update_duty_cycles(&mut self.active_duty_cycles, &values, period);
     }
 
     /// Increases permanences for columns with low overlap duty cycle.
@@ -577,7 +573,7 @@ impl SpatialPooler {
         }
     }
 
-    /// Updates boost factors based on active duty cycles.
+    /// Updates boost factors based on active duty cycles using SIMD-accelerated exp.
     fn update_boost_factors(&mut self) {
         if self.boost_strength <= 0.0 {
             return;
@@ -586,12 +582,16 @@ impl SpatialPooler {
         let target_density = self.local_area_density;
 
         if self.global_inhibition {
-            for i in 0..self.num_columns {
-                self.boost_factors[i] =
-                    (self.boost_strength * (target_density - self.active_duty_cycles[i])).exp();
-            }
+            // Use SIMD-accelerated boost factor computation
+            simd::compute_boost_factors(
+                &self.active_duty_cycles,
+                &mut self.boost_factors,
+                target_density,
+                self.boost_strength,
+            );
         } else {
             // Local boosting based on neighborhood average
+            // This is harder to SIMD-accelerate due to variable neighborhood sizes
             for column in 0..self.num_columns {
                 let neighbors = match self.neighbor_map.get(column) {
                     Some(n) => n,
@@ -605,7 +605,7 @@ impl SpatialPooler {
                     / neighbors.len().max(1) as Real;
 
                 self.boost_factors[column] =
-                    (self.boost_strength * (neighbor_avg - self.active_duty_cycles[column])).exp();
+                    simd::fast_exp_f32(self.boost_strength * (neighbor_avg - self.active_duty_cycles[column]));
             }
         }
     }

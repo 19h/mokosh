@@ -10,7 +10,7 @@
 
 use crate::error::{MokoshError, Result};
 use crate::types::{ElemDense, ElemSparse, Real, UInt};
-use crate::utils::Random;
+use crate::utils::{simd, Random};
 
 use std::cell::RefCell;
 use std::fmt;
@@ -662,24 +662,8 @@ impl Sdr {
         let a = self.get_sparse();
         let b = other.get_sparse();
 
-        // Use set intersection for sorted vectors
-        let mut count = 0;
-        let mut i = 0;
-        let mut j = 0;
-
-        while i < a.len() && j < b.len() {
-            match a[i].cmp(&b[j]) {
-                std::cmp::Ordering::Less => i += 1,
-                std::cmp::Ordering::Greater => j += 1,
-                std::cmp::Ordering::Equal => {
-                    count += 1;
-                    i += 1;
-                    j += 1;
-                }
-            }
-        }
-
-        count
+        // Use SIMD-accelerated sorted overlap
+        simd::sorted_overlap(&a, &b)
     }
 
     // ========================================================================

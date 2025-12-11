@@ -16,9 +16,9 @@ rust-version = "1.70"
 name = "mokosh"
 path = "src/lib.rs"
 
-# [[bin]]
-# name = "mokosh-bench"
-# path = "src/bin/bench.rs"
+[[bin]]
+name = "perf_test"
+path = "src/bin/perf_test.rs"
 
 [features]
 default = ["std"]
@@ -49,10 +49,10 @@ criterion = { version = "0.5", features = ["html_reports"] }
 proptest = "1.4"
 test-case = "3.3"
 
-# Benchmarks will be added later during performance optimization
-# [[bench]]
-# name = "sdr_benchmark"
-# harness = false
+# SIMD benchmarks for all computational hot paths
+[[bench]]
+name = "simd_benchmarks"
+harness = false
 
 [profile.release]
 lto = true

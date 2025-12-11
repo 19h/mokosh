@@ -6,6 +6,7 @@
 mod random;
 mod topology;
 mod sdr_metrics;
+pub mod simd;
 
 pub use random::Random;
 pub use topology::{Topology, WrappingMode, Neighborhood};
