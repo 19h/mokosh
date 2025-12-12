@@ -29,6 +29,7 @@
 //! ## Text Encoders
 //! - [`SimHashDocumentEncoder`]: Encodes documents/text with similarity preservation
 //! - [`WordEmbeddingEncoder`]: Converts dense word vectors (word2vec/GloVe) to SDRs
+//! - [`LlmEmbeddingEncoder`]: Converts LLM embeddings of arbitrary dimensions (384-3072+) to SDRs
 //! - [`CharacterEncoder`]: Character-level encoding with optional semantic similarity
 //! - [`NGramEncoder`]: Encodes character or word n-grams
 //!
@@ -107,6 +108,7 @@ mod pitch;
 mod word_embedding;
 mod character;
 mod ngram;
+mod llm_embedding;
 
 // Vision encoders
 mod patch;
@@ -161,6 +163,9 @@ pub use pitch::{PitchEncoder, PitchEncoderParams, Pitch};
 pub use word_embedding::{WordEmbeddingEncoder, WordEmbeddingEncoderParams};
 pub use character::{CharacterEncoder, CharacterEncoderParams};
 pub use ngram::{NGramEncoder, NGramEncoderParams};
+pub use llm_embedding::{
+    DimensionStrategy, LlmEmbeddingEncoder, LlmEmbeddingEncoderParams, NormalizationStrategy,
+};
 
 // Vision encoders
 pub use patch::{PatchEncoder, PatchEncoderParams, ImagePatch};
