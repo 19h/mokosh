@@ -20,6 +20,10 @@ path = "src/lib.rs"
 name = "perf_test"
 path = "src/bin/perf_test.rs"
 
+[[example]]
+name = "ecg_anomaly_detection"
+path = "examples/ecg_anomaly_detection.rs"
+
 [features]
 default = ["std"]
 std = []
