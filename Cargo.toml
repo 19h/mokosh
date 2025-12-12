@@ -24,6 +24,14 @@ path = "src/bin/perf_test.rs"
 name = "ecg_anomaly_detection"
 path = "examples/ecg_anomaly_detection.rs"
 
+[[example]]
+name = "ecg_fingerprints"
+path = "examples/ecg_fingerprints.rs"
+
+[[example]]
+name = "htm_fingerprints"
+path = "examples/htm_fingerprints.rs"
+
 [features]
 default = ["std"]
 std = []
@@ -52,6 +60,7 @@ bitvec = "1.0"
 criterion = { version = "0.5", features = ["html_reports"] }
 proptest = "1.4"
 test-case = "3.3"
+image = "0.25"
 
 # SIMD benchmarks for all computational hot paths
 [[bench]]
