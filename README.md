@@ -15,7 +15,7 @@ Mokosh provides a complete implementation of the core HTM algorithms for sequenc
 - **Spatial Pooler** - Creates sparse, distributed representations of input patterns
 - **Temporal Memory** - Learns sequences and makes predictions
 - **Anomaly Detection** - Identifies unusual patterns in data streams
-- **38 Encoders** - Convert raw data into SDR format (scalar, categorical, temporal, audio, vision, network, biometric, financial, probabilistic)
+- **39 Encoders** - Convert raw data into SDR format (scalar, categorical, temporal, audio, vision, network, biometric, financial, probabilistic) - see [ENCODERS.md](ENCODERS.md)
 - **SIMD Optimizations** - AVX2-accelerated operations for boost factors, duty cycles, and permanence updates
 - **Serialization** - Save and load models in binary or JSON format
 - **Zero unsafe code in core algorithms** - Safe Rust implementation
@@ -184,7 +184,7 @@ tm.reset();
 
 ### Encoders
 
-Mokosh includes 38 encoders across multiple domains:
+Mokosh includes 39 encoders across multiple domains. See [ENCODERS.md](ENCODERS.md) for comprehensive documentation.
 
 #### Scalar Encoders
 ```rust
@@ -234,7 +234,7 @@ let encoder = DateEncoder::new(DateEncoderParams {
 |----------|----------|
 | **Categorical** | CategoryEncoder, BooleanEncoder, OrdinalEncoder, HierarchicalCategoryEncoder, SetEncoder, DeltaEncoder |
 | **Temporal** | DateEncoder, CoordinateEncoder, GeospatialEncoder, GridCellEncoder |
-| **Text/NLP** | SimHashDocumentEncoder, WordEmbeddingEncoder, CharacterEncoder, NGramEncoder |
+| **Text/NLP** | SimHashDocumentEncoder, WordEmbeddingEncoder, LlmEmbeddingEncoder, CharacterEncoder, NGramEncoder |
 | **Audio** | SpectrogramEncoder, WaveformEncoder, PitchEncoder |
 | **Vision** | PatchEncoder, ColorEncoder, EdgeOrientationEncoder |
 | **Network** | IpAddressEncoder, MacAddressEncoder, GraphNodeEncoder |
