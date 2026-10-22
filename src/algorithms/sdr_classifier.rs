@@ -4,7 +4,7 @@
 //! It can be used for both classification and prediction tasks.
 
 use crate::types::{Real, Sdr, UInt};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 
 #[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
@@ -69,7 +69,11 @@ pub struct SdrClassifier {
     weights: HashMap<UInt, HashMap<u32, HashMap<u32, Real>>>,
 
     /// History of active patterns for multi-step prediction.
-    pattern_history: Vec<Vec<u32>>,
+    pattern_history: VecDeque<(u64, Vec<u32>)>,
+
+    /// Category counts can differ until each prediction horizon is trained.
+    num_buckets: HashMap<UInt, usize>,
+    input_size: Option<usize>,
 
     /// Maximum bucket index seen.
     max_bucket: u32,
@@ -81,6 +85,17 @@ pub struct SdrClassifier {
 impl SdrClassifier {
     /// Creates a new SDR Classifier.
     pub fn new(params: SdrClassifierParams) -> Self {
+        assert!(
+            params.alpha.is_finite() && params.alpha > 0.0,
+            "Learning rate must be finite and positive"
+        );
+        assert!(
+            !params.steps.is_empty(),
+            "At least one prediction step is required"
+        );
+        let mut params = params;
+        params.steps.sort_unstable();
+        params.steps.dedup();
         let mut weights = HashMap::new();
         for &step in &params.steps {
             weights.insert(step, HashMap::new());
@@ -90,7 +105,9 @@ impl SdrClassifier {
             alpha: params.alpha,
             steps: params.steps,
             weights,
-            pattern_history: Vec::new(),
+            pattern_history: VecDeque::new(),
+            num_buckets: HashMap::new(),
+            input_size: None,
             max_bucket: 0,
             iteration: 0,
         }
@@ -103,38 +120,56 @@ impl SdrClassifier {
     /// * `pattern` - The SDR pattern
     /// * `bucket_idx` - The target bucket index
     pub fn learn(&mut self, pattern: &Sdr, bucket_idx: u32) {
-        self.max_bucket = self.max_bucket.max(bucket_idx);
-        self.iteration += 1;
+        let record = self.pattern_history.back().map_or(0, |(n, _)| {
+            n.checked_add(1).expect("Record number overflow")
+        });
+        self.learn_at(record, pattern, &[bucket_idx]);
+    }
 
-        let sparse = pattern.get_sparse();
-
-        // Store pattern for multi-step prediction
-        self.pattern_history.push(sparse.clone());
-
-        // Clone steps to avoid borrowing issues
-        let steps = self.steps.clone();
-
-        // Learn for each step
-        for step in steps {
-            let step_usize = step as usize;
-
-            // Get the pattern from `step` iterations ago
-            if self.pattern_history.len() > step_usize {
-                let past_pattern =
-                    self.pattern_history[self.pattern_history.len() - 1 - step_usize].clone();
-
-                // Get current predictions
-                let predictions = self.compute_predictions(&past_pattern, step);
-
-                // Compute error and update weights
-                self.update_weights(&past_pattern, bucket_idx, &predictions, step);
-            }
+    /// Learns one or more equally weighted categories at a monotonic record number.
+    /// Gaps represent missing observations, not adjacent time steps. Repeated
+    /// record numbers refine the same input record, as in htm.core Predictor.
+    pub fn learn_at(&mut self, record: u64, pattern: &Sdr, buckets: &[u32]) {
+        assert!(
+            pattern.size() > 0 && !buckets.is_empty(),
+            "Training needs an input and categories"
+        );
+        if let Some(size) = self.input_size {
+            assert_eq!(pattern.size(), size, "Classifier input size changed");
         }
-
-        // Limit history size
-        let max_step = *self.steps.iter().max().unwrap_or(&1);
-        if self.pattern_history.len() > max_step as usize + 1 {
-            self.pattern_history.remove(0);
+        self.input_size = Some(pattern.size());
+        if let Some((last, _)) = self.pattern_history.back() {
+            assert!(record >= *last, "Record numbers must be monotonic");
+        }
+        let mut buckets = buckets.to_vec();
+        buckets.sort_unstable();
+        buckets.dedup();
+        let max_bucket = *buckets.last().unwrap();
+        assert!(max_bucket < u32::MAX, "Category count must fit u32");
+        self.max_bucket = self.max_bucket.max(max_bucket);
+        self.iteration += 1;
+        if self.pattern_history.back().map(|(n, _)| *n) != Some(record) {
+            self.pattern_history
+                .push_back((record, pattern.get_sparse()));
+        }
+        let max_step = u64::from(*self.steps.last().unwrap());
+        while self
+            .pattern_history
+            .front()
+            .is_some_and(|(n, _)| record - *n > max_step)
+        {
+            self.pattern_history.pop_front();
+        }
+        let history: Vec<_> = self.pattern_history.iter().cloned().collect();
+        for (past_record, past_pattern) in history {
+            let delta = record - past_record;
+            if delta <= u64::from(u32::MAX) && self.steps.binary_search(&(delta as UInt)).is_ok() {
+                let step = delta as UInt;
+                let count = self.num_buckets.entry(step).or_default();
+                *count = (*count).max(max_bucket as usize + 1);
+                let predictions = self.compute_predictions(&past_pattern, step);
+                self.update_weights(&past_pattern, &buckets, &predictions, step);
+            }
         }
     }
 
@@ -148,6 +183,10 @@ impl SdrClassifier {
     ///
     /// A map from prediction step to bucket probability distributions.
     pub fn infer(&self, pattern: &Sdr) -> HashMap<UInt, Vec<Real>> {
+        assert!(pattern.size() > 0, "Classifier input must be nonempty");
+        if let Some(size) = self.input_size {
+            assert_eq!(pattern.size(), size, "Classifier input size changed");
+        }
         let sparse = pattern.get_sparse();
         let mut results = HashMap::new();
 
@@ -161,7 +200,7 @@ impl SdrClassifier {
 
     /// Computes raw predictions for a pattern.
     fn compute_predictions(&self, sparse: &[u32], step: UInt) -> Vec<Real> {
-        let num_buckets = (self.max_bucket + 1) as usize;
+        let num_buckets = self.num_buckets.get(&step).copied().unwrap_or(0);
         let mut predictions = vec![0.0; num_buckets];
 
         if let Some(step_weights) = self.weights.get(&step) {
@@ -185,7 +224,7 @@ impl SdrClassifier {
     fn update_weights(
         &mut self,
         sparse: &[u32],
-        actual_bucket: u32,
+        actual_buckets: &[u32],
         predictions: &[Real],
         step: UInt,
     ) {
@@ -194,8 +233,12 @@ impl SdrClassifier {
         for &input_bit in sparse {
             let bit_weights = step_weights.entry(input_bit).or_default();
 
-            for bucket in 0..=self.max_bucket {
-                let target = if bucket == actual_bucket { 1.0 } else { 0.0 };
+            for bucket in 0..predictions.len() as u32 {
+                let target = if actual_buckets.binary_search(&bucket).is_ok() {
+                    1.0 / actual_buckets.len() as Real
+                } else {
+                    0.0
+                };
                 let prediction = predictions.get(bucket as usize).copied().unwrap_or(0.0);
                 let error = target - prediction;
 
@@ -237,7 +280,7 @@ impl SdrClassifier {
         step_predictions
             .iter()
             .enumerate()
-            .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
+            .max_by(|a, b| a.1.total_cmp(b.1).then(b.0.cmp(&a.0)))
             .map(|(idx, _)| idx as u32)
     }
 
@@ -351,7 +394,7 @@ mod tests {
         let max_idx = probs
             .iter()
             .enumerate()
-            .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
+            .max_by(|a, b| a.1.total_cmp(b.1).then(b.0.cmp(&a.0)))
             .map(|(idx, _)| idx);
         assert_eq!(max_idx, Some(0));
     }

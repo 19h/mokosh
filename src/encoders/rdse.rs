@@ -121,6 +121,18 @@ impl RandomDistributedScalarEncoder {
             });
         }
 
+        for (name, value) in [
+            ("sparsity", params.sparsity),
+            ("radius", params.radius),
+            ("resolution", params.resolution),
+        ] {
+            if !value.is_finite() || value < 0.0 {
+                return Err(MokoshError::InvalidParameter {
+                    name,
+                    message: "Must be finite and nonnegative".into(),
+                });
+            }
+        }
         // Validate active_bits/sparsity (mutually exclusive)
         let num_active_args = (params.active_bits > 0) as u8 + (params.sparsity > 0.0) as u8;
         if num_active_args == 0 {
@@ -170,6 +182,12 @@ impl RandomDistributedScalarEncoder {
             }
         }
 
+        if active_bits > params.size {
+            return Err(MokoshError::InvalidParameter {
+                name: "active_bits",
+                message: "Cannot exceed size".into(),
+            });
+        }
         // Calculate sparsity for consistency
         let sparsity = active_bits as Real / params.size as Real;
 
@@ -188,7 +206,7 @@ impl RandomDistributedScalarEncoder {
 
         // Generate seed if 0
         let seed = if params.seed == 0 {
-            Random::new(rand::random::<i64>().abs()).get_uint32()
+            Random::with_random_seed().seed() as u32
         } else {
             params.seed
         };
@@ -334,8 +352,17 @@ impl Encoder<Real> for RandomDistributedScalarEncoder {
             });
         }
 
-        // Calculate bucket index
-        let index = (value / self.resolution) as u32;
+        if !value.is_finite() {
+            return Err(MokoshError::InvalidParameter {
+                name: "value",
+                message: "Input must be finite".into(),
+            });
+        }
+        // Define wrapping explicitly. Rust's float-to-u32 cast saturates negative
+        // values, which otherwise collapses the entire negative domain to zero.
+        let index = (f64::from(value) / f64::from(self.resolution))
+            .trunc()
+            .rem_euclid(4294967296.0) as u32;
 
         // Generate active bits using hashing
         let mut sparse = Vec::with_capacity(self.active_bits as usize);

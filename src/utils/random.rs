@@ -3,12 +3,49 @@
 //! This module provides a deterministic pseudo-random number generator that
 //! produces the same sequences as the C++ implementation when given the same seed.
 
-use rand::{Rng, SeedableRng};
-use rand_chacha::ChaCha20Rng;
+use rand::Rng;
+
+/// MT19937 with the standard 32-bit seed initialization.
+#[derive(Clone)]
+struct Mt19937 {
+    state: [u32; 624],
+    index: usize,
+}
+
+impl Mt19937 {
+    fn new(seed: u32) -> Self {
+        let mut state = [0; 624];
+        state[0] = seed;
+        for i in 1..624 {
+            state[i] = 1812433253u32
+                .wrapping_mul(state[i - 1] ^ (state[i - 1] >> 30))
+                .wrapping_add(i as u32);
+        }
+        Self { state, index: 624 }
+    }
+
+    fn next(&mut self) -> u32 {
+        if self.index == 624 {
+            for i in 0..624 {
+                let x = (self.state[i] & 0x80000000) | (self.state[(i + 1) % 624] & 0x7fffffff);
+                self.state[i] = self.state[(i + 397) % 624]
+                    ^ (x >> 1)
+                    ^ if x & 1 != 0 { 0x9908b0df } else { 0 };
+            }
+            self.index = 0;
+        }
+        let mut y = self.state[self.index];
+        self.index += 1;
+        y ^= y >> 11;
+        y ^= (y << 7) & 0x9d2c5680;
+        y ^= (y << 15) & 0xefc60000;
+        y ^ (y >> 18)
+    }
+}
 
 /// A pseudo-random number generator compatible with htm.core.
 ///
-/// Uses ChaCha20 for high-quality randomness with deterministic behavior
+/// Uses MT19937, matching the reference generator and 32-bit draws
 /// when seeded. The implementation aims to be reproducible across platforms.
 ///
 /// # Example
@@ -32,7 +69,7 @@ use rand_chacha::ChaCha20Rng;
 /// rng.shuffle(&mut items);
 /// ```
 pub struct Random {
-    rng: ChaCha20Rng,
+    rng: Mt19937,
     seed: u64,
     /// Number of random values generated (for state reconstruction).
     steps: u64,
@@ -47,6 +84,7 @@ mod serde_impl {
 
     #[derive(Serialize, Deserialize)]
     struct RandomState {
+        algorithm: u32,
         seed: u64,
         steps: u64,
     }
@@ -57,6 +95,7 @@ mod serde_impl {
             S: Serializer,
         {
             let state = RandomState {
+                algorithm: 0x4d543031,
                 seed: self.seed,
                 steps: self.steps,
             };
@@ -70,10 +109,15 @@ mod serde_impl {
             D: Deserializer<'de>,
         {
             let state = RandomState::deserialize(deserializer)?;
-            let mut rng = ChaCha20Rng::seed_from_u64(state.seed);
+            if state.algorithm != 0x4d543031 {
+                return Err(serde::de::Error::custom(
+                    "Unsupported RNG checkpoint algorithm",
+                ));
+            }
+            let mut rng = Mt19937::new(state.seed as u32);
             // Advance the RNG to match the serialized state
             for _ in 0..state.steps {
-                let _: u64 = rng.gen();
+                rng.next();
             }
             Ok(Random {
                 rng,
@@ -87,19 +131,18 @@ mod serde_impl {
 impl Random {
     /// Creates a new random number generator with the given seed.
     ///
-    /// If seed is 0, uses a default seed (0 is a valid seed that produces
-    /// deterministic output).
+    /// Seed 0 or a negative seed requests a randomly generated, nonzero seed.
     #[must_use]
     pub fn new(seed: i64) -> Self {
-        let actual_seed = if seed < 0 {
+        let actual_seed = if seed <= 0 {
             // Negative seed means use system randomness
-            rand::thread_rng().gen()
+            rand::thread_rng().gen_range(1..=u32::MAX) as u64
         } else {
             seed as u64
         };
 
         Self {
-            rng: ChaCha20Rng::seed_from_u64(actual_seed),
+            rng: Mt19937::new(actual_seed as u32),
             seed: actual_seed,
             steps: 0,
         }
@@ -123,55 +166,58 @@ impl Random {
         self.steps
     }
 
-    /// Generates a random u32.
+    /// Draws one raw MT19937 word and counts engine consumption.
+    fn next_word(&mut self) -> u32 {
+        self.steps += 1;
+        self.rng.next()
+    }
+
+    /// Generates a u32 in [0, u32::MAX), as htm.core getUInt32().
     pub fn get_uint32(&mut self) -> u32 {
-        self.steps += 1;
-        self.rng.gen()
+        self.next_word() % u32::MAX
     }
 
-    /// Generates a random u64.
+    /// Generates a u64 from two consecutive engine words.
     pub fn get_uint64(&mut self) -> u64 {
-        self.steps += 1;
-        self.rng.gen()
+        ((self.next_word() as u64) << 32) | self.next_word() as u64
     }
 
-    /// Generates a random u32 in the range [min, max).
+    /// Generates a u32 in [min, max). Empty ranges return min.
     pub fn get_uint32_range(&mut self, min: u32, max: u32) -> u32 {
-        self.steps += 1;
         if min >= max {
             return min;
         }
-        self.rng.gen_range(min..max)
+        min + self.next_word() % (max - min)
     }
 
-    /// Generates a random u64 in the range [min, max).
+    /// Generates a u64 in [min, max). Empty ranges return min.
     pub fn get_uint64_range(&mut self, min: u64, max: u64) -> u64 {
-        self.steps += 1;
         if min >= max {
             return min;
         }
-        self.rng.gen_range(min..max)
+        min + self.get_uint64() % (max - min)
     }
 
-    /// Generates a random usize in the range [0, n).
+    /// Generates a usize in [0, n). Empty ranges return zero.
     pub fn get_usize(&mut self, n: usize) -> usize {
-        self.steps += 1;
         if n == 0 {
             return 0;
         }
-        self.rng.gen_range(0..n)
+        if n <= u32::MAX as usize {
+            self.next_word() as usize % n
+        } else {
+            (self.get_uint64() % n as u64) as usize
+        }
     }
 
-    /// Generates a random f32 in [0, 1).
+    /// Generates an f32 by rounding the reference f64 draw.
     pub fn get_real32(&mut self) -> f32 {
-        self.steps += 1;
-        self.rng.gen()
+        self.get_real64() as f32
     }
 
-    /// Generates a random f64 in [0, 1).
+    /// Generates an f64 in [0, 1], matching htm.core's division by MT19937::max().
     pub fn get_real64(&mut self) -> f64 {
-        self.steps += 1;
-        self.rng.gen()
+        self.next_word() as f64 / u32::MAX as f64
     }
 
     /// Generates a random f64 in the range [min, max).
@@ -184,8 +230,7 @@ impl Random {
 
     /// Generates a random boolean with 50% probability.
     pub fn get_bool(&mut self) -> bool {
-        self.steps += 1;
-        self.rng.gen()
+        self.get_uint32_range(0, 2) != 0
     }
 
     /// Generates a random boolean with the given probability of being true.
@@ -211,19 +256,11 @@ impl Random {
     /// Returns a vector of `k` randomly selected items from the input.
     /// If `k >= items.len()`, returns a shuffled copy of all items.
     pub fn sample<T: Clone>(&mut self, mut items: Vec<T>, k: usize) -> Vec<T> {
-        let n = items.len();
-        if k >= n {
-            self.shuffle(&mut items);
-            return items;
+        if k == 0 {
+            return Vec::new();
         }
-
-        // Use partial Fisher-Yates for efficiency when k << n
-        for i in 0..k {
-            let j = self.get_usize(n - i) + i;
-            items.swap(i, j);
-        }
-
-        items.truncate(k);
+        self.shuffle(&mut items);
+        items.truncate(k.min(items.len()));
         items
     }
 
@@ -263,7 +300,7 @@ impl Random {
     /// Returns a normally distributed random number using Box-Muller transform.
     pub fn normal(&mut self, mean: f64, std_dev: f64) -> f64 {
         // Box-Muller transform
-        let u1 = self.get_real64();
+        let u1 = self.get_real64().max(f64::MIN_POSITIVE);
         let u2 = self.get_real64();
 
         let mag = std_dev * (-2.0 * u1.ln()).sqrt();
@@ -274,7 +311,7 @@ impl Random {
 
     /// Returns an exponentially distributed random number.
     pub fn exponential(&mut self, lambda: f64) -> f64 {
-        -self.get_real64().ln() / lambda
+        -self.get_real64().max(f64::MIN_POSITIVE).ln() / lambda
     }
 }
 

@@ -95,7 +95,7 @@ impl Topology {
         Self::neighborhood_recursive(
             &center_coords,
             dimensions,
-            radius as i32,
+            i64::from(radius),
             wrap,
             0,
             &mut vec![0; dimensions.len()],
@@ -113,7 +113,7 @@ impl Topology {
     fn neighborhood_recursive(
         center: &[UInt],
         dimensions: &[UInt],
-        radius: i32,
+        radius: i64,
         wrap: WrappingMode,
         dim: usize,
         current: &mut Vec<UInt>,
@@ -125,26 +125,38 @@ impl Topology {
             return;
         }
 
-        let center_coord = center[dim] as i32;
-        let dim_size = dimensions[dim] as i32;
+        let center_coord = i64::from(center[dim]);
+        let dim_size = i64::from(dimensions[dim]);
+        assert!(dim_size > 0, "Topology dimensions must be positive");
 
-        for offset in -radius..=radius {
-            let coord = center_coord + offset;
-
+        // Cap each axis before enumerating the Cartesian product. Wrapping
+        // must never emit the same coordinate more than once.
+        let (start, end) = match wrap {
+            WrappingMode::NoWrap => (
+                (center_coord - radius).max(0),
+                (center_coord + radius).min(dim_size - 1),
+            ),
+            WrappingMode::Wrap => (
+                center_coord - radius,
+                (center_coord - radius) + (2 * radius + 1).min(dim_size) - 1,
+            ),
+        };
+        for coord in start..=end {
             let valid_coord = match wrap {
-                WrappingMode::NoWrap => {
-                    if coord < 0 || coord >= dim_size {
-                        continue;
-                    }
-                    coord as UInt
-                }
-                WrappingMode::Wrap => {
-                    ((coord % dim_size) + dim_size) as UInt % dimensions[dim]
-                }
+                WrappingMode::NoWrap => coord as UInt,
+                WrappingMode::Wrap => coord.rem_euclid(dim_size) as UInt,
             };
 
             current[dim] = valid_coord;
-            Self::neighborhood_recursive(center, dimensions, radius, wrap, dim + 1, current, result);
+            Self::neighborhood_recursive(
+                center,
+                dimensions,
+                radius,
+                wrap,
+                dim + 1,
+                current,
+                result,
+            );
         }
     }
 
@@ -211,13 +223,7 @@ impl Topology {
     ) -> Vec<usize> {
         let center = Self::map_column_to_input(column_index, column_dimensions, input_dimensions);
 
-        Self::neighborhood(
-            center,
-            input_dimensions,
-            potential_radius,
-            wrap,
-            true,
-        )
+        Self::neighborhood(center, input_dimensions, potential_radius, wrap, true)
     }
 
     /// Computes the total number of elements in a dimensional space.
@@ -240,8 +246,8 @@ impl Topology {
         }
 
         let num_dims = input_dimensions.len();
-        let avg_connected: f64 = num_connected.iter().map(|&n| n as f64).sum::<f64>()
-            / num_connected.len() as f64;
+        let avg_connected: f64 =
+            num_connected.iter().map(|&n| n as f64).sum::<f64>() / num_connected.len() as f64;
 
         // Estimate radius from average connections
         // For a hypercube: connections ≈ (2*r+1)^num_dims
@@ -253,6 +259,7 @@ impl Topology {
 
 /// Represents a cached neighborhood map for efficient lookups.
 #[derive(Debug, Clone)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct Neighborhood {
     /// Pre-computed neighbors for each cell.
     neighbors: HashMap<usize, Vec<usize>>,
@@ -278,13 +285,7 @@ impl Neighborhood {
         let mut neighbors = HashMap::with_capacity(num_cells);
 
         for i in 0..num_cells {
-            let cell_neighbors = Topology::neighborhood(
-                i,
-                dimensions,
-                radius,
-                wrap,
-                !skip_center,
-            );
+            let cell_neighbors = Topology::neighborhood(i, dimensions, radius, wrap, !skip_center);
             neighbors.insert(i, cell_neighbors);
         }
 
@@ -345,7 +346,10 @@ mod tests {
         assert_eq!(Topology::index_to_coordinates(8, &[3, 3]), vec![2, 2]);
 
         // 3D
-        assert_eq!(Topology::index_to_coordinates(13, &[2, 3, 4]), vec![1, 0, 1]);
+        assert_eq!(
+            Topology::index_to_coordinates(13, &[2, 3, 4]),
+            vec![1, 0, 1]
+        );
     }
 
     #[test]
@@ -425,13 +429,7 @@ mod tests {
 
     #[test]
     fn test_potential_pool() {
-        let pool = Topology::map_potential_pool(
-            0,
-            &[5],
-            &[10],
-            2,
-            WrappingMode::NoWrap,
-        );
+        let pool = Topology::map_potential_pool(0, &[5], &[10], 2, WrappingMode::NoWrap);
 
         // Column 0 maps to input 1, with radius 2
         assert!(pool.len() >= 3);

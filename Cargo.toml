@@ -2,6 +2,7 @@
 name = "mokosh"
 version = "0.1.0"
 edition = "2021"
+autoexamples = false
 authors = ["HTM Rust Port Contributors"]
 description = "A high-performance Rust implementation of Hierarchical Temporal Memory (HTM) algorithms"
 license = "AGPL-3.0"
@@ -10,7 +11,7 @@ documentation = "https://docs.rs/mokosh"
 readme = "README.md"
 keywords = ["htm", "machine-learning", "ai", "neural-network", "temporal-memory"]
 categories = ["algorithms", "science"]
-rust-version = "1.70"
+rust-version = "1.85"
 
 [lib]
 name = "mokosh"
@@ -42,8 +43,8 @@ rayon = ["dep:rayon"]
 [dependencies]
 # Core dependencies
 thiserror = "1.0"
+sha3 = "0.10"
 rand = { version = "0.8", features = ["std_rng"] }
-rand_chacha = "0.3"
 
 # Optional dependencies
 serde = { version = "1.0", features = ["derive"], optional = true }

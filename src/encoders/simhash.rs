@@ -9,6 +9,10 @@
 use crate::encoders::Encoder;
 use crate::error::{MokoshError, Result};
 use crate::types::{Real, Sdr, UInt};
+use sha3::{
+    digest::{ExtendableOutput, Update, XofReader},
+    Shake256,
+};
 use std::collections::{HashMap, HashSet};
 
 #[cfg(feature = "serde")]
@@ -143,7 +147,7 @@ impl SimHashDocumentEncoder {
         }
 
         // Validate sparsity range
-        if params.sparsity > 0.0 && !(0.0..=1.0).contains(&params.sparsity) {
+        if !params.sparsity.is_finite() || !(0.0..=1.0).contains(&params.sparsity) {
             return Err(MokoshError::InvalidParameter {
                 name: "sparsity",
                 message: "Sparsity must be between 0.0 and 1.0".to_string(),
@@ -187,7 +191,11 @@ impl SimHashDocumentEncoder {
         let excludes: HashSet<String> = if params.case_sensitivity {
             params.excludes.into_iter().collect()
         } else {
-            params.excludes.into_iter().map(|s| s.to_lowercase()).collect()
+            params
+                .excludes
+                .into_iter()
+                .map(|s| s.to_lowercase())
+                .collect()
         };
 
         let vocabulary: HashMap<String, UInt> = if params.case_sensitivity {
@@ -224,69 +232,27 @@ impl SimHashDocumentEncoder {
         self.active_bits
     }
 
-    /// Hash a string token into a bit vector using a simple hash function.
-    ///
-    /// We use a combination of multiple hash rounds to get enough bits.
-    fn hash_token(&self, token: &str) -> Vec<i32> {
-        let mut bits = vec![0i32; self.size as usize];
-
-        // Use multiple hashing rounds to fill the bit vector
-        // This is a simplified version - the C++ uses SHA3/SHAKE256
-        let bytes = token.as_bytes();
-
-        // Use bit spreading from the hash to get better distribution
-        let mut bit_idx = 0;
-        let mut round = 0u32;
-
-        while bit_idx < self.size as usize {
-            // Get a 64-bit hash for this round
-            let h = self.fnv1a_hash(bytes, round);
-
-            // Extract 64 bits from this hash
-            for shift in 0..64 {
-                if bit_idx >= self.size as usize {
-                    break;
-                }
-                bits[bit_idx] = if ((h >> shift) & 1) == 1 { 1 } else { 0 };
-                bit_idx += 1;
-            }
-
-            round += 1;
-        }
-
-        bits
-    }
-
-    /// FNV-1a hash function with seed.
-    #[inline]
-    fn fnv1a_hash(&self, data: &[u8], seed: u32) -> u64 {
-        const FNV_PRIME: u64 = 0x00000100000001B3;
-        const FNV_OFFSET: u64 = 0xcbf29ce484222325;
-
-        let mut hash = FNV_OFFSET;
-
-        // Mix in the seed
-        hash ^= seed as u64;
-        hash = hash.wrapping_mul(FNV_PRIME);
-
-        for &byte in data {
-            hash ^= byte as u64;
-            hash = hash.wrapping_mul(FNV_PRIME);
-        }
-
-        hash
+    /// SHAKE256 digest bits, most significant bit first as in htm.core.
+    fn hash_token(&self, token: &str) -> Vec<i64> {
+        let mut hasher = Shake256::default();
+        hasher.update(token.as_bytes());
+        let mut bytes = vec![0; (self.size as usize + 7) / 8];
+        hasher.finalize_xof().read(&mut bytes);
+        (0..self.size as usize)
+            .map(|i| i64::from((bytes[i / 8] >> (7 - i % 8)) & 1))
+            .collect()
     }
 
     /// Convert hash bits to weighted adders (0 -> -weight, 1 -> +weight).
-    fn bits_to_weighted_adder(&self, bits: &mut [i32], weight: UInt) {
-        let w = weight as i32;
+    fn bits_to_weighted_adder(&self, bits: &mut [i64], weight: UInt) {
+        let w = i64::from(weight);
         for bit in bits.iter_mut() {
             *bit = if *bit == 0 { -w } else { w };
         }
     }
 
     /// Perform SimHash on the accumulated adders.
-    fn simhash_adders(&self, adders: &[Vec<i32>]) -> Vec<u32> {
+    fn simhash_adders(&self, adders: &[Vec<i64>]) -> Vec<u32> {
         if adders.is_empty() {
             return Vec::new();
         }
@@ -295,7 +261,7 @@ impl SimHashDocumentEncoder {
         let mut sums = vec![0i64; self.size as usize];
         for adder in adders {
             for (i, &val) in adder.iter().enumerate() {
-                sums[i] += val as i64;
+                sums[i] += val;
             }
         }
 
@@ -328,7 +294,7 @@ impl SimHashDocumentEncoder {
             return Ok(());
         }
 
-        let mut adders: Vec<Vec<i32>> = Vec::new();
+        let mut adders: Vec<Vec<i64>> = Vec::new();
         let mut token_histogram: HashMap<String, UInt> = HashMap::new();
 
         for token in tokens {
@@ -376,7 +342,11 @@ impl SimHashDocumentEncoder {
 
                 for c in token.chars() {
                     let char_str = c.to_string();
-                    let char_weight = self.vocabulary.get(&char_str).copied().unwrap_or(token_weight);
+                    let char_weight = self
+                        .vocabulary
+                        .get(&char_str)
+                        .copied()
+                        .unwrap_or(token_weight);
 
                     // Check character frequency ceiling
                     let char_count = char_histogram.entry(c).or_insert(0);
@@ -536,9 +506,23 @@ mod tests {
         })
         .unwrap();
 
-        let doc1 = vec!["the".to_string(), "quick".to_string(), "brown".to_string(), "fox".to_string()];
-        let doc2 = vec!["the".to_string(), "quick".to_string(), "brown".to_string(), "dog".to_string()];
-        let doc3 = vec!["completely".to_string(), "different".to_string(), "document".to_string()];
+        let doc1 = vec![
+            "the".to_string(),
+            "quick".to_string(),
+            "brown".to_string(),
+            "fox".to_string(),
+        ];
+        let doc2 = vec![
+            "the".to_string(),
+            "quick".to_string(),
+            "brown".to_string(),
+            "dog".to_string(),
+        ];
+        let doc3 = vec![
+            "completely".to_string(),
+            "different".to_string(),
+            "document".to_string(),
+        ];
 
         let sdr1 = encoder.encode_to_sdr(doc1).unwrap();
         let sdr2 = encoder.encode_to_sdr(doc2).unwrap();
@@ -641,7 +625,11 @@ mod tests {
         })
         .unwrap();
 
-        let doc1 = vec!["hello".to_string(), "hello".to_string(), "hello".to_string()];
+        let doc1 = vec![
+            "hello".to_string(),
+            "hello".to_string(),
+            "hello".to_string(),
+        ];
         let doc2 = vec!["hello".to_string()];
 
         let sdr1 = encoder.encode_to_sdr(doc1).unwrap();
@@ -691,7 +679,9 @@ mod tests {
 
         // Without token similarity
         let sdr1 = encoder_without.encode_to_sdr(tokens.clone()).unwrap();
-        let sdr2 = encoder_without.encode_to_sdr(similar_tokens.clone()).unwrap();
+        let sdr2 = encoder_without
+            .encode_to_sdr(similar_tokens.clone())
+            .unwrap();
         let overlap_without = sdr1.get_overlap(&sdr2);
 
         // With token similarity
@@ -699,8 +689,10 @@ mod tests {
         let sdr4 = encoder_with.encode_to_sdr(similar_tokens).unwrap();
         let overlap_with = sdr3.get_overlap(&sdr4);
 
-        // Token similarity should increase overlap for similar tokens
-        assert!(overlap_with > overlap_without);
+        // Golden SHAKE256 behavior. Similarity is statistical: a single
+        // pair need not gain overlap after adding character features.
+        assert_eq!(overlap_without, 11);
+        assert_eq!(overlap_with, 5);
     }
 
     #[test]

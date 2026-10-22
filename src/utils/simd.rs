@@ -4,53 +4,50 @@
 //! used throughout the HTM algorithms. It includes runtime feature detection
 //! and fallback scalar implementations.
 
-#[cfg(target_arch = "x86_64")]
+#[cfg(all(feature = "simd", target_arch = "x86_64"))]
 use std::arch::x86_64::*;
-
-#[cfg(target_arch = "aarch64")]
-use std::arch::aarch64::*;
 
 // =============================================================================
 // RUNTIME FEATURE DETECTION
 // =============================================================================
 
 /// Check if AVX2 is available at runtime.
-#[cfg(target_arch = "x86_64")]
+#[cfg(all(feature = "simd", target_arch = "x86_64"))]
 #[inline]
 pub fn has_avx2() -> bool {
     is_x86_feature_detected!("avx2")
 }
 
 /// Check if AVX2 is available (always false on non-x86).
-#[cfg(not(target_arch = "x86_64"))]
+#[cfg(not(all(feature = "simd", target_arch = "x86_64")))]
 #[inline]
 pub fn has_avx2() -> bool {
     false
 }
 
 /// Check if FMA is available at runtime.
-#[cfg(target_arch = "x86_64")]
+#[cfg(all(feature = "simd", target_arch = "x86_64"))]
 #[inline]
 pub fn has_fma() -> bool {
     is_x86_feature_detected!("fma")
 }
 
 /// Check if FMA is available (always false on non-x86).
-#[cfg(not(target_arch = "x86_64"))]
+#[cfg(not(all(feature = "simd", target_arch = "x86_64")))]
 #[inline]
 pub fn has_fma() -> bool {
     false
 }
 
 /// Check if NEON is available (always true on aarch64).
-#[cfg(target_arch = "aarch64")]
+#[cfg(all(feature = "simd", target_arch = "aarch64"))]
 #[inline]
 pub fn has_neon() -> bool {
     true
 }
 
 /// Check if NEON is available (always false on non-ARM).
-#[cfg(not(target_arch = "aarch64"))]
+#[cfg(not(all(feature = "simd", target_arch = "aarch64")))]
 #[inline]
 pub fn has_neon() -> bool {
     false
@@ -79,9 +76,9 @@ pub fn fast_exp_f32(x: f32) -> f32 {
 /// Batch exponential computation with automatic SIMD dispatch.
 #[inline]
 pub fn exp_batch(input: &[f32], output: &mut [f32]) {
-    debug_assert_eq!(input.len(), output.len());
+    assert_eq!(input.len(), output.len());
 
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(all(feature = "simd", target_arch = "x86_64"))]
     {
         if has_avx2() {
             unsafe { exp_batch_avx2(input, output) };
@@ -102,7 +99,7 @@ fn exp_batch_scalar(input: &[f32], output: &mut [f32]) {
 }
 
 /// AVX2 implementation of batch exp.
-#[cfg(target_arch = "x86_64")]
+#[cfg(all(feature = "simd", target_arch = "x86_64"))]
 #[target_feature(enable = "avx2")]
 unsafe fn exp_batch_avx2(input: &[f32], output: &mut [f32]) {
     let len = input.len();
@@ -156,13 +153,18 @@ pub fn compute_boost_factors(
     target_density: f32,
     boost_strength: f32,
 ) {
-    debug_assert_eq!(duty_cycles.len(), boost_factors.len());
+    assert_eq!(duty_cycles.len(), boost_factors.len());
 
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(all(feature = "simd", target_arch = "x86_64"))]
     {
         if has_avx2() {
             unsafe {
-                compute_boost_factors_avx2(duty_cycles, boost_factors, target_density, boost_strength)
+                compute_boost_factors_avx2(
+                    duty_cycles,
+                    boost_factors,
+                    target_density,
+                    boost_strength,
+                )
             };
             return;
         }
@@ -186,7 +188,7 @@ fn compute_boost_factors_scalar(
 }
 
 /// AVX2 implementation of boost factor computation.
-#[cfg(target_arch = "x86_64")]
+#[cfg(all(feature = "simd", target_arch = "x86_64"))]
 #[target_feature(enable = "avx2")]
 unsafe fn compute_boost_factors_avx2(
     duty_cycles: &[f32],
@@ -235,7 +237,8 @@ unsafe fn compute_boost_factors_avx2(
     let remainder_start = chunks * 8;
     for i in remainder_start..len {
         let duty = *duty_cycles.get_unchecked(i);
-        *boost_factors.get_unchecked_mut(i) = fast_exp_f32(boost_strength * (target_density - duty));
+        *boost_factors.get_unchecked_mut(i) =
+            fast_exp_f32(boost_strength * (target_density - duty));
     }
 }
 
@@ -245,13 +248,10 @@ unsafe fn compute_boost_factors_avx2(
 
 /// Batch update permanences with clamping: perm[i] = clamp(perm[i] + delta[i], 0, 1)
 #[inline]
-pub fn update_permanences_batch(
-    permanences: &mut [f32],
-    deltas: &[f32],
-) {
-    debug_assert_eq!(permanences.len(), deltas.len());
+pub fn update_permanences_batch(permanences: &mut [f32], deltas: &[f32]) {
+    assert_eq!(permanences.len(), deltas.len());
 
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(all(feature = "simd", target_arch = "x86_64"))]
     {
         if has_avx2() {
             unsafe { update_permanences_avx2(permanences, deltas) };
@@ -272,7 +272,7 @@ fn update_permanences_scalar(permanences: &mut [f32], deltas: &[f32]) {
 }
 
 /// AVX2 implementation of permanence updates.
-#[cfg(target_arch = "x86_64")]
+#[cfg(all(feature = "simd", target_arch = "x86_64"))]
 #[target_feature(enable = "avx2")]
 unsafe fn update_permanences_avx2(permanences: &mut [f32], deltas: &[f32]) {
     let len = permanences.len();
@@ -318,12 +318,14 @@ pub fn update_permanences_masked(
     increment: f32,
     decrement: f32,
 ) {
-    debug_assert_eq!(permanences.len(), active_mask.len());
+    assert_eq!(permanences.len(), active_mask.len());
 
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(all(feature = "simd", target_arch = "x86_64"))]
     {
         if has_avx2() {
-            unsafe { update_permanences_masked_avx2(permanences, active_mask, increment, decrement) };
+            unsafe {
+                update_permanences_masked_avx2(permanences, active_mask, increment, decrement)
+            };
             return;
         }
     }
@@ -336,7 +338,7 @@ pub fn update_permanences_masked(
 }
 
 /// AVX2 implementation of masked permanence updates.
-#[cfg(target_arch = "x86_64")]
+#[cfg(all(feature = "simd", target_arch = "x86_64"))]
 #[target_feature(enable = "avx2")]
 unsafe fn update_permanences_masked_avx2(
     permanences: &mut [f32],
@@ -362,21 +364,61 @@ unsafe fn update_permanences_masked_avx2(
 
         // Build mask from bools (convert to f32 mask)
         let mask_slice = &active_mask[offset..offset + 8];
-        let mask_bits: i32 = mask_slice.iter().enumerate().fold(0, |acc, (j, &b)| {
-            if b { acc | (1 << j) } else { acc }
-        });
+        let mask_bits: i32 =
+            mask_slice.iter().enumerate().fold(
+                0,
+                |acc, (j, &b)| {
+                    if b {
+                        acc | (1 << j)
+                    } else {
+                        acc
+                    }
+                },
+            );
 
         // Use blendv to select between inc and dec
         // Create mask vector: -1.0 for true, 0.0 for false
         let mask_f32: [f32; 8] = [
-            if mask_slice[0] { f32::from_bits(0xFFFFFFFF) } else { 0.0 },
-            if mask_slice[1] { f32::from_bits(0xFFFFFFFF) } else { 0.0 },
-            if mask_slice[2] { f32::from_bits(0xFFFFFFFF) } else { 0.0 },
-            if mask_slice[3] { f32::from_bits(0xFFFFFFFF) } else { 0.0 },
-            if mask_slice[4] { f32::from_bits(0xFFFFFFFF) } else { 0.0 },
-            if mask_slice[5] { f32::from_bits(0xFFFFFFFF) } else { 0.0 },
-            if mask_slice[6] { f32::from_bits(0xFFFFFFFF) } else { 0.0 },
-            if mask_slice[7] { f32::from_bits(0xFFFFFFFF) } else { 0.0 },
+            if mask_slice[0] {
+                f32::from_bits(0xFFFFFFFF)
+            } else {
+                0.0
+            },
+            if mask_slice[1] {
+                f32::from_bits(0xFFFFFFFF)
+            } else {
+                0.0
+            },
+            if mask_slice[2] {
+                f32::from_bits(0xFFFFFFFF)
+            } else {
+                0.0
+            },
+            if mask_slice[3] {
+                f32::from_bits(0xFFFFFFFF)
+            } else {
+                0.0
+            },
+            if mask_slice[4] {
+                f32::from_bits(0xFFFFFFFF)
+            } else {
+                0.0
+            },
+            if mask_slice[5] {
+                f32::from_bits(0xFFFFFFFF)
+            } else {
+                0.0
+            },
+            if mask_slice[6] {
+                f32::from_bits(0xFFFFFFFF)
+            } else {
+                0.0
+            },
+            if mask_slice[7] {
+                f32::from_bits(0xFFFFFFFF)
+            } else {
+                0.0
+            },
         ];
         let mask_vec = _mm256_loadu_ps(mask_f32.as_ptr());
 
@@ -395,7 +437,11 @@ unsafe fn update_permanences_masked_avx2(
     let remainder_start = chunks * 8;
     for i in remainder_start..len {
         let perm = permanences.get_unchecked_mut(i);
-        let delta = if *active_mask.get_unchecked(i) { increment } else { -decrement };
+        let delta = if *active_mask.get_unchecked(i) {
+            increment
+        } else {
+            -decrement
+        };
         *perm = (*perm + delta).clamp(0.0, 1.0);
     }
 }
@@ -407,14 +453,10 @@ unsafe fn update_permanences_masked_avx2(
 /// Update duty cycles using exponential moving average.
 /// duty[i] = ((period - 1) * duty[i] + value[i]) / period
 #[inline]
-pub fn update_duty_cycles(
-    duty_cycles: &mut [f32],
-    values: &[f32],
-    period: f32,
-) {
-    debug_assert_eq!(duty_cycles.len(), values.len());
+pub fn update_duty_cycles(duty_cycles: &mut [f32], values: &[f32], period: f32) {
+    assert_eq!(duty_cycles.len(), values.len());
 
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(all(feature = "simd", target_arch = "x86_64"))]
     {
         if has_avx2() {
             unsafe { update_duty_cycles_avx2(duty_cycles, values, period) };
@@ -438,7 +480,7 @@ fn update_duty_cycles_scalar(duty_cycles: &mut [f32], values: &[f32], period: f3
 }
 
 /// AVX2 implementation of duty cycle updates.
-#[cfg(target_arch = "x86_64")]
+#[cfg(all(feature = "simd", target_arch = "x86_64"))]
 #[target_feature(enable = "avx2")]
 unsafe fn update_duty_cycles_avx2(duty_cycles: &mut [f32], values: &[f32], period: f32) {
     let len = duty_cycles.len();
@@ -479,12 +521,8 @@ unsafe fn update_duty_cycles_avx2(duty_cycles: &mut [f32], values: &[f32], perio
 
 /// Update duty cycles from overlap counts (converting u16 overlaps to 0/1 values).
 #[inline]
-pub fn update_duty_cycles_from_overlaps(
-    duty_cycles: &mut [f32],
-    overlaps: &[u16],
-    period: f32,
-) {
-    debug_assert_eq!(duty_cycles.len(), overlaps.len());
+pub fn update_duty_cycles_from_overlaps(duty_cycles: &mut [f32], overlaps: &[u16], period: f32) {
+    assert_eq!(duty_cycles.len(), overlaps.len());
 
     let period_minus_1 = period - 1.0;
     let inv_period = 1.0 / period;
@@ -535,7 +573,7 @@ pub fn sorted_overlap_scalar(a: &[u32], b: &[u32]) -> usize {
 }
 
 /// AVX2 implementation of sorted overlap using galloping search.
-#[cfg(target_arch = "x86_64")]
+#[cfg(all(feature = "simd", target_arch = "x86_64"))]
 #[target_feature(enable = "avx2")]
 unsafe fn sorted_overlap_avx2(a: &[u32], b: &[u32]) -> usize {
     // Use adaptive algorithm: if sizes are very different, use galloping
@@ -553,7 +591,7 @@ unsafe fn sorted_overlap_avx2(a: &[u32], b: &[u32]) -> usize {
 }
 
 /// Galloping binary search overlap for very different sized arrays.
-#[cfg(target_arch = "x86_64")]
+#[cfg(all(feature = "simd", target_arch = "x86_64"))]
 fn galloping_overlap(smaller: &[u32], larger: &[u32]) -> usize {
     let mut count = 0;
     let mut search_start = 0;
@@ -576,7 +614,7 @@ fn galloping_overlap(smaller: &[u32], larger: &[u32]) -> usize {
 }
 
 /// SIMD-accelerated merge overlap for similar-sized arrays.
-#[cfg(target_arch = "x86_64")]
+#[cfg(all(feature = "simd", target_arch = "x86_64"))]
 #[target_feature(enable = "avx2")]
 unsafe fn simd_merge_overlap(a: &[u32], b: &[u32]) -> usize {
     // For now, use optimized scalar with prefetching hints
@@ -627,9 +665,9 @@ unsafe fn simd_merge_overlap(a: &[u32], b: &[u32]) -> usize {
 /// Multiply vector by scalar and add to output: out[i] = a[i] * scalar + out[i]
 #[inline]
 pub fn fmadd_scalar_batch(a: &[f32], scalar: f32, out: &mut [f32]) {
-    debug_assert_eq!(a.len(), out.len());
+    assert_eq!(a.len(), out.len());
 
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(all(feature = "simd", target_arch = "x86_64"))]
     {
         if has_avx2() && has_fma() {
             unsafe { fmadd_scalar_avx2(a, scalar, out) };
@@ -644,7 +682,7 @@ pub fn fmadd_scalar_batch(a: &[f32], scalar: f32, out: &mut [f32]) {
 }
 
 /// AVX2+FMA implementation of scalar multiply-add.
-#[cfg(target_arch = "x86_64")]
+#[cfg(all(feature = "simd", target_arch = "x86_64"))]
 #[target_feature(enable = "avx2", enable = "fma")]
 unsafe fn fmadd_scalar_avx2(a: &[f32], scalar: f32, out: &mut [f32]) {
     let len = a.len();
@@ -691,7 +729,14 @@ mod tests {
             let rel_error = (fast - accurate).abs() / accurate;
             // Allow up to 4% error for Schraudolph's approximation
             // This is acceptable for boost factor computation
-            assert!(rel_error < 0.04, "fast_exp({}) = {}, expected {}, error = {}", x, fast, accurate, rel_error);
+            assert!(
+                rel_error < 0.04,
+                "fast_exp({}) = {}, expected {}, error = {}",
+                x,
+                fast,
+                accurate,
+                rel_error
+            );
         }
     }
 
@@ -704,7 +749,13 @@ mod tests {
 
         for (i, (&inp, &out)) in input.iter().zip(output.iter()).enumerate() {
             let expected = fast_exp_f32(inp);
-            assert!((out - expected).abs() < 1e-6, "Mismatch at {}: {} vs {}", i, out, expected);
+            assert!(
+                (out - expected).abs() < 1e-6,
+                "Mismatch at {}: {} vs {}",
+                i,
+                out,
+                expected
+            );
         }
     }
 
@@ -719,7 +770,13 @@ mod tests {
 
         for (i, (&duty, &boost)) in duty_cycles.iter().zip(boost_factors.iter()).enumerate() {
             let expected = fast_exp_f32(strength * (target - duty));
-            assert!((boost - expected).abs() < 1e-5, "Mismatch at {}: {} vs {}", i, boost, expected);
+            assert!(
+                (boost - expected).abs() < 1e-5,
+                "Mismatch at {}: {} vs {}",
+                i,
+                boost,
+                expected
+            );
         }
     }
 
@@ -747,9 +804,9 @@ mod tests {
         update_duty_cycles(&mut duties, &values, period);
 
         // duty = (9 * old + new) / 10
-        assert!((duties[0] - 0.1).abs() < 1e-6);  // (9*0 + 1) / 10 = 0.1
+        assert!((duties[0] - 0.1).abs() < 1e-6); // (9*0 + 1) / 10 = 0.1
         assert!((duties[1] - 0.55).abs() < 1e-6); // (9*0.5 + 1) / 10 = 0.55
-        assert!((duties[2] - 0.9).abs() < 1e-6);  // (9*1 + 0) / 10 = 0.9
+        assert!((duties[2] - 0.9).abs() < 1e-6); // (9*1 + 0) / 10 = 0.9
     }
 
     #[test]

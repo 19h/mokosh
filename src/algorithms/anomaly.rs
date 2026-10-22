@@ -4,6 +4,7 @@
 //! using HTM predictions.
 
 use crate::types::{Real, Sdr, UInt};
+use std::collections::VecDeque;
 
 #[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
@@ -78,6 +79,7 @@ impl Anomaly {
         predictive_cells: &Sdr,
         cells_per_column: UInt,
     ) -> Real {
+        assert!(cells_per_column > 0, "cells_per_column must be positive");
         let active_cols = active_columns.get_sparse();
 
         if active_cols.is_empty() {
@@ -117,7 +119,12 @@ pub struct AnomalyLikelihood {
     reestimation_period: usize,
 
     /// Historical anomaly scores.
-    historical_scores: Vec<Real>,
+    historical_scores: VecDeque<Real>,
+    history_limit: usize,
+    aggregation_window: usize,
+    recent_scores: VecDeque<Real>,
+    recent_sum: f64,
+    previous_tail: f64,
 
     /// Running sum for mean calculation.
     running_sum: f64,
@@ -146,16 +153,45 @@ impl AnomalyLikelihood {
     /// * `learning_period` - Number of samples to collect before computing statistics
     /// * `estimation_samples` - Number of samples to use for estimation
     /// * `reestimation_period` - How often to reestimate parameters
-    pub fn new(learning_period: usize, estimation_samples: usize, reestimation_period: usize) -> Self {
+    pub fn new(
+        learning_period: usize,
+        estimation_samples: usize,
+        reestimation_period: usize,
+    ) -> Self {
+        Self::with_window(
+            learning_period,
+            estimation_samples,
+            8640usize.max(estimation_samples),
+            reestimation_period,
+            10,
+        )
+    }
+
+    /// Configures the bounded history and moving-average window independently.
+    pub fn with_window(
+        learning_period: usize,
+        estimation_samples: usize,
+        history_limit: usize,
+        reestimation_period: usize,
+        aggregation_window: usize,
+    ) -> Self {
+        assert!(estimation_samples > 0 && history_limit >= estimation_samples);
+        assert!(reestimation_period > 0 && aggregation_window > 0);
+        assert!(learning_period.checked_add(estimation_samples).is_some());
         Self {
             learning_period,
             estimation_samples,
             reestimation_period,
-            historical_scores: Vec::with_capacity(estimation_samples),
+            historical_scores: VecDeque::new(),
+            history_limit,
+            aggregation_window,
+            recent_scores: VecDeque::new(),
+            recent_sum: 0.0,
+            previous_tail: 1.0,
             running_sum: 0.0,
             running_sum_sq: 0.0,
             mean: 0.5,
-            variance: 0.0001,
+            variance: 0.0003,
             iteration: 0,
             last_reestimation: 0,
         }
@@ -176,58 +212,87 @@ impl AnomalyLikelihood {
     ///
     /// Anomaly likelihood between 0.0 and 1.0.
     pub fn anomaly_probability(&mut self, anomaly_score: Real) -> Real {
-        self.iteration += 1;
-
-        // Add to historical scores
-        if self.historical_scores.len() >= self.estimation_samples {
-            let removed = self.historical_scores.remove(0);
-            self.running_sum -= removed as f64;
-            self.running_sum_sq -= (removed as f64) * (removed as f64);
+        assert!(
+            anomaly_score.is_finite() && (0.0..=1.0).contains(&anomaly_score),
+            "Anomaly scores must be finite and in [0, 1]"
+        );
+        self.recent_scores.push_back(anomaly_score);
+        self.recent_sum += f64::from(anomaly_score);
+        if self.recent_scores.len() > self.aggregation_window {
+            self.recent_sum -= f64::from(self.recent_scores.pop_front().unwrap());
         }
+        let average = self.recent_sum / self.recent_scores.len() as f64;
+        self.iteration += 1;
+        if self.historical_scores.len() == self.history_limit {
+            let removed = f64::from(self.historical_scores.pop_front().unwrap());
+            self.running_sum -= removed;
+            self.running_sum_sq -= removed * removed;
+        }
+        self.historical_scores.push_back(average as Real);
+        // Accumulate exactly the values retained in the history.
+        let stored = f64::from(average as Real);
+        self.running_sum += stored;
+        self.running_sum_sq += stored * stored;
 
-        self.historical_scores.push(anomaly_score);
-        self.running_sum += anomaly_score as f64;
-        self.running_sum_sq += (anomaly_score as f64) * (anomaly_score as f64);
-
-        // Reestimate parameters periodically
-        if self.iteration >= self.learning_period
-            && self.iteration - self.last_reestimation >= self.reestimation_period
+        if self.iteration <= self.learning_period + self.estimation_samples {
+            return 0.5;
+        }
+        if self.last_reestimation == 0
+            || self.iteration - self.last_reestimation >= self.reestimation_period
         {
             self.estimate_parameters();
             self.last_reestimation = self.iteration;
         }
-
-        // During learning period, return 0.5 (neutral)
-        if self.iteration < self.learning_period {
-            return 0.5;
-        }
-
-        // Compute likelihood using Gaussian tail probability
-        self.compute_log_likelihood(anomaly_score as f64)
+        // Match the reference's symmetric Gaussian tail. Evaluate the current
+        // observation, not the oldest value of the history buffer.
+        let z = (average - self.mean).abs() / self.variance.sqrt();
+        let tail = 0.5 * erfc(z / std::f64::consts::SQRT_2);
+        let filtered = if tail <= 1e-5 && self.previous_tail <= 1e-5 {
+            1e-3
+        } else {
+            tail
+        };
+        self.previous_tail = filtered;
+        (1.0 - filtered) as Real
     }
 
-    /// Estimates mean and variance from historical data.
     fn estimate_parameters(&mut self) {
-        let n = self.historical_scores.len() as f64;
-        if n < 2.0 {
+        // Exclude initial learning records still present in the sliding window.
+        let shifted = self.iteration.saturating_sub(self.historical_scores.len());
+        let skip = self
+            .learning_period
+            .saturating_sub(shifted)
+            .min(self.historical_scores.len());
+        let n = self.historical_scores.len() - skip;
+        if n == 0 {
+            self.mean = 0.5;
+            self.variance = 1e6;
             return;
         }
-
-        self.mean = self.running_sum / n;
-        self.variance = (self.running_sum_sq / n) - (self.mean * self.mean);
-        self.variance = self.variance.max(0.0001); // Minimum variance
+        let mean = self
+            .historical_scores
+            .iter()
+            .skip(skip)
+            .map(|&x| f64::from(x))
+            .sum::<f64>()
+            / n as f64;
+        let variance = self
+            .historical_scores
+            .iter()
+            .skip(skip)
+            .map(|&x| (f64::from(x) - mean).powi(2))
+            .sum::<f64>()
+            / n as f64;
+        self.mean = mean.max(0.03);
+        self.variance = variance.max(0.0003);
     }
 
-    /// Computes the log-likelihood based anomaly probability.
-    fn compute_log_likelihood(&self, value: f64) -> Real {
-        // Gaussian tail probability
-        let z = (value - self.mean) / self.variance.sqrt();
-
-        // Use complementary error function approximation for tail probability
-        let prob = 0.5 * erfc(z / std::f64::consts::SQRT_2);
-
-        // Convert to anomaly likelihood (high probability = high likelihood of anomaly)
-        (1.0 - prob) as Real
+    /// Maps a probability to [0, 1] on the reference logarithmic scale.
+    /// Uses f64 so the epsilon is not rounded away at probability 1.
+    pub fn compute_log_likelihood(probability: Real) -> Real {
+        assert!(probability.is_finite() && (0.0..=1.0).contains(&probability));
+        ((1.0000000001_f64 - f64::from(probability)).ln() / -23.02585084720009).clamp(0.0, 1.0)
+            as Real
     }
 }
 
@@ -250,9 +315,8 @@ fn erfc(x: f64) -> f64 {
                         + t * (-0.18628806
                             + t * (0.27886807
                                 + t * (-1.13520398
-                                    + t * (1.48851587
-                                        + t * (-0.82215223 + t * 0.17087277)))))))))
-        .exp();
+                                    + t * (1.48851587 + t * (-0.82215223 + t * 0.17087277)))))))))
+            .exp();
 
     if x >= 0.0 {
         tau
@@ -306,7 +370,7 @@ mod tests {
         let mut likelihood = AnomalyLikelihood::new(10, 50, 10);
 
         // Feed normal anomaly scores during learning
-        for _ in 0..20 {
+        for _ in 0..70 {
             let prob = likelihood.anomaly_probability(0.1);
             // During learning period, should return 0.5
             if likelihood.iteration < 10 {

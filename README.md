@@ -3,11 +3,13 @@
 A high-performance Rust implementation of Hierarchical Temporal Memory (HTM) algorithms, ported from the [htm.core](https://github.com/htm-community/htm.core) C++ library.
 
 [![License: AGPL-3.0](https://img.shields.io/badge/License-AGPL%20v3-blue.svg)](https://www.gnu.org/licenses/agpl-3.0)
-[![Rust](https://img.shields.io/badge/rust-1.70%2B-orange.svg)](https://www.rust-lang.org)
+[![Rust](https://img.shields.io/badge/rust-1.85%2B-orange.svg)](https://www.rust-lang.org)
 
 ## Overview
 
-Mokosh provides a complete implementation of the core HTM algorithms for sequence learning, anomaly detection, and pattern recognition. HTM is a machine learning technology that aims to capture the structural and algorithmic properties of the neocortex.
+Mokosh implements the core HTM algorithms for sequence learning, anomaly detection, and pattern recognition. HTM is a machine learning technology that aims to capture the structural and algorithmic properties of the neocortex.
+
+See [the port review](PORT_REVIEW.md) for verified behavior, reference fixtures, known differences and migration requirements. Models trained before these corrections require retraining.
 
 ### Key Features
 
@@ -15,11 +17,11 @@ Mokosh provides a complete implementation of the core HTM algorithms for sequenc
 - **Spatial Pooler** - Creates sparse, distributed representations of input patterns
 - **Temporal Memory** - Learns sequences and makes predictions
 - **Anomaly Detection** - Identifies unusual patterns in data streams
-- **39 Encoders** - Convert raw data into SDR format (scalar, categorical, temporal, audio, vision, network, biometric, financial, probabilistic) - see [ENCODERS.md](ENCODERS.md)
+- **38 Encoders** - Convert raw data into SDR format (scalar, categorical, temporal, audio, vision, network, biometric, financial, probabilistic) - see [ENCODERS.md](ENCODERS.md)
 - **SIMD Optimizations** - AVX2-accelerated operations for boost factors, duty cycles, and permanence updates
 - **Serialization** - Save and load models in binary or JSON format
 - **Zero unsafe code in core algorithms** - Safe Rust implementation
-- **Well tested** - 450+ unit tests with comprehensive coverage including property-based testing
+- **Regression coverage** - Unit, property, persistence and compiled C++ reference tests
 
 ## Installation
 
@@ -32,10 +34,10 @@ mokosh = "0.1"
 
 ### Feature Flags
 
-- `std` (default) - Standard library support
+- `std` (default) - Compatibility flag; the standard library is required in every configuration
 - `serde` - Serialization/deserialization support (adds `serde`, `serde_json`, `bincode`)
-- `rayon` - Parallel processing support
-- `simd` - SIMD optimizations (enabled by default on x86_64)
+- `rayon` - Enables the dependency; algorithms currently execute serially
+- `simd` - Enables runtime-dispatched SIMD utilities on supported processors; disabled by default
 
 ```toml
 [dependencies]
@@ -83,7 +85,7 @@ sp.compute(&input_sdr, true, &mut active_columns);
 tm.compute(&active_columns, true);
 
 // Get predictions and anomaly score
-let predictions = tm.get_predictive_cells();
+let predictions = tm.predictive_cells();
 let anomaly = tm.anomaly();
 println!("Anomaly score: {}", anomaly);
 ```
@@ -131,7 +133,7 @@ let mut sp = SpatialPooler::new(SpatialPoolerParams {
     syn_perm_connected: 0.1,
     syn_perm_active_inc: 0.05,
     syn_perm_inactive_dec: 0.008,
-    boost_strength: 3.0,  // SIMD-accelerated boost computation
+    boost_strength: 3.0,  // Reference-accurate boost computation
     ..Default::default()
 }).unwrap();
 
@@ -173,9 +175,9 @@ let active_columns = Sdr::new(&[2048]);
 tm.compute(&active_columns, true);
 
 // Get results
-let active_cells = tm.get_active_cells();
-let predictive_cells = tm.get_predictive_cells();
-let winner_cells = tm.get_winner_cells();
+let active_cells = tm.active_cells();
+let predictive_cells = tm.predictive_cells();
+let winner_cells = tm.winner_cells();
 let anomaly_score = tm.anomaly();
 
 // Reset for new sequence
@@ -184,7 +186,7 @@ tm.reset();
 
 ### Encoders
 
-Mokosh includes 39 encoders across multiple domains. See [ENCODERS.md](ENCODERS.md) for comprehensive documentation.
+Mokosh includes 38 encoders across multiple domains. See [ENCODERS.md](ENCODERS.md) for comprehensive documentation.
 
 #### Scalar Encoders
 ```rust
@@ -274,7 +276,7 @@ let mut classifier = SdrClassifier::new(SdrClassifierParams {
 
 let pattern = Sdr::new(&[2048]);
 classifier.learn(&pattern, bucket_idx);
-let probabilities = classifier.infer(&pattern, 1);
+let probabilities = classifier.infer(&pattern);
 ```
 
 ### Serialization
@@ -295,14 +297,12 @@ let sp2 = SpatialPooler::load_from_file("spatial_pooler.bin", SerializableFormat
 
 Mokosh includes SIMD optimizations for critical hot paths:
 
-### SIMD-Accelerated Operations
+### Numeric behavior
 
-| Operation | Speedup | Description |
-|-----------|---------|-------------|
-| Boost factors | ~30% faster | Fast exp() approximation with AVX2 |
-| Duty cycle updates | ~5% faster | Vectorized exponential moving average |
-| Permanence updates | ~2-4x faster | Batch clamping with SIMD min/max |
-| SDR overlap | Optimized | Cache-efficient two-pointer merge |
+Duty-cycle and permanence utilities have optional SIMD implementations. Spatial
+Pooler boosting uses accurate exponentials to preserve reference behavior.
+Performance depends on hardware and workload; this review did not establish
+speedup measurements.
 
 ### Benchmarking
 
@@ -326,7 +326,7 @@ cargo run --release --bin perf_test -- --compare v1
 - **SmallVec** - Stack allocation for small segment/synapse collections
 - **AHash** - Fast hash map implementation for connection lookups
 - **Zero-copy where possible** - Minimizes memory allocations
-- **Optional parallelism** - Enable `rayon` feature for parallel processing
+- **Deterministic randomness** - Reference-compatible MT19937 with exact checkpoint continuation
 
 ## Architecture
 
@@ -368,7 +368,7 @@ mokosh/
 ## Testing
 
 ```bash
-# Run all tests (450+)
+# Run unit, integration, property and documentation tests
 cargo test
 
 # Run with serde feature
@@ -386,19 +386,23 @@ cargo test -- --nocapture
 
 ## Comparison with htm.core
 
-Mokosh is a faithful port of the core HTM algorithms from htm.core:
+Core behavior is compared with a pinned htm.core build. This is not a claim of
+complete API, numerical or serialization-format equivalence.
 
-| Component | Status | Notes |
-|-----------|--------|-------|
-| SDR | Complete | Full sparse/dense/coordinate support |
-| Spatial Pooler | Complete | Global and local inhibition, SIMD boost |
-| Temporal Memory | Complete | All learning rules |
-| Connections | Complete | Segment and synapse management |
-| Anomaly Detection | Complete | Raw and likelihood modes |
-| SDR Classifier | Complete | Multi-step prediction |
-| Encoders | Extended | 38 encoders (more than htm.core) |
-| Serialization | Complete | Binary and JSON formats |
-| SIMD | New | AVX2 optimizations not in htm.core |
+| Component | Coverage | Notes |
+|-----------|----------|-------|
+| SDR | Reviewed | Sparse/dense/coordinate invariants and axis-aware concatenation |
+| Spatial Pooler | C++ fixtures | Global/local inhibition and multidimensional learning |
+| Temporal Memory | C++ fixtures + regressions | Learning, next-step predictions and external context |
+| Connections | Reviewed | Capacity, pruning, threshold and time-series rules |
+| Anomaly Detection | Reviewed | Raw, rolling likelihood and finite logarithmic scores; documented upstream differences |
+| SDR Classifier | C++ fixtures | Record gaps, multiple horizons and multilabel targets |
+| Encoders | Shared families reviewed | Scalar, RDSE, Date and SHAKE256 SimHash; additional domain encoders are Rust extensions |
+| Serialization | Continuation tested | Rust binary/JSON formats; not Cereal-compatible |
+| SIMD | Optional Rust utilities | Runtime dispatch with checked buffer lengths |
+
+See [PORT_REVIEW.md](PORT_REVIEW.md) for the assumption register, primary source
+provenance, validation commands and remaining differences.
 
 ### Not Included
 

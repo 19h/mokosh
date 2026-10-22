@@ -44,7 +44,8 @@ impl Default for OrdinalEncoderParams {
 /// Encodes ordinal (ordered) categories into SDR representations.
 ///
 /// Unlike categorical encoding, ordinal encoding preserves order:
-/// adjacent categories share more overlap than distant ones.
+/// adjacent categories share more overlap when their spacing is less than
+/// `active_bits`. Larger output sizes can separate even adjacent categories.
 ///
 /// # Example
 ///
@@ -57,7 +58,7 @@ impl Default for OrdinalEncoderParams {
 ///         "medium".to_string(),
 ///         "high".to_string(),
 ///     ],
-///     size: 60,
+///     size: 40,
 ///     active_bits: 15,
 /// }).unwrap();
 ///
@@ -157,12 +158,13 @@ impl Encoder<&str> for OrdinalEncoder {
     }
 
     fn encode(&self, category: &str, output: &mut Sdr) -> Result<()> {
-        let index = self.category_map.get(category).ok_or_else(|| {
-            MokoshError::InvalidParameter {
-                name: "category",
-                message: format!("Unknown category: {}", category),
-            }
-        })?;
+        let index =
+            self.category_map
+                .get(category)
+                .ok_or_else(|| MokoshError::InvalidParameter {
+                    name: "category",
+                    message: format!("Unknown category: {}", category),
+                })?;
 
         if output.dimensions() != self.dimensions.as_slice() {
             return Err(MokoshError::DimensionMismatch {

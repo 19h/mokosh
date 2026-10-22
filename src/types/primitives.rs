@@ -30,32 +30,14 @@ pub type Real32 = f32;
 /// 64-bit floating point number.
 pub type Real64 = f64;
 
-/// Default signed integer type.
-/// Uses 32-bit by default, can be changed to 64-bit with feature flag.
-#[cfg(not(feature = "big_integer"))]
+/// Default signed integer type (32-bit).
 pub type Int = Int32;
 
-/// Default signed integer type (64-bit variant).
-#[cfg(feature = "big_integer")]
-pub type Int = Int64;
-
-/// Default unsigned integer type.
-/// Uses 32-bit by default, can be changed to 64-bit with feature flag.
-#[cfg(not(feature = "big_integer"))]
+/// Default unsigned integer type (32-bit).
 pub type UInt = UInt32;
 
-/// Default unsigned integer type (64-bit variant).
-#[cfg(feature = "big_integer")]
-pub type UInt = UInt64;
-
-/// Default floating point type.
-/// Uses 32-bit by default, can be changed to 64-bit with feature flag.
-#[cfg(not(feature = "double_precision"))]
+/// Default floating point type (32-bit).
 pub type Real = Real32;
-
-/// Default floating point type (64-bit variant).
-#[cfg(feature = "double_precision")]
-pub type Real = Real64;
 
 /// Index type for cells in the connections graph.
 /// Must match `ElemSparse` for SDR compatibility.

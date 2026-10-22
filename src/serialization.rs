@@ -136,13 +136,11 @@ pub trait Serializable: Serialize + DeserializeOwned + Sized {
     fn save<W: Write>(&self, writer: W, format: SerializableFormat) -> Result<()> {
         let mut writer = BufWriter::new(writer);
         match format {
-            SerializableFormat::Binary => {
-                bincode::serialize_into(&mut writer, self).map_err(|e| {
-                    MokoshError::SerializationError {
-                        message: format!("Binary serialization failed: {}", e),
-                    }
-                })
-            }
+            SerializableFormat::Binary => bincode::serialize_into(&mut writer, self).map_err(|e| {
+                MokoshError::SerializationError {
+                    message: format!("Binary serialization failed: {}", e),
+                }
+            }),
             SerializableFormat::Json => {
                 serde_json::to_writer_pretty(&mut writer, self).map_err(|e| {
                     MokoshError::SerializationError {
@@ -150,25 +148,24 @@ pub trait Serializable: Serialize + DeserializeOwned + Sized {
                     }
                 })
             }
-        }
+        }?;
+        writer.flush().map_err(|e| MokoshError::IoError {
+            message: format!("Failed to flush serialized data: {}", e),
+        })
     }
 
     /// Deserializes from a reader.
     fn load<R: Read>(reader: R, format: SerializableFormat) -> Result<Self> {
         let mut reader = BufReader::new(reader);
         match format {
-            SerializableFormat::Binary => {
-                bincode::deserialize_from(&mut reader).map_err(|e| {
-                    MokoshError::SerializationError {
-                        message: format!("Binary deserialization failed: {}", e),
-                    }
-                })
-            }
+            SerializableFormat::Binary => bincode::deserialize_from(&mut reader).map_err(|e| {
+                MokoshError::SerializationError {
+                    message: format!("Binary deserialization failed: {}", e),
+                }
+            }),
             SerializableFormat::Json => {
-                serde_json::from_reader(&mut reader).map_err(|e| {
-                    MokoshError::SerializationError {
-                        message: format!("JSON deserialization failed: {}", e),
-                    }
+                serde_json::from_reader(&mut reader).map_err(|e| MokoshError::SerializationError {
+                    message: format!("JSON deserialization failed: {}", e),
                 })
             }
         }

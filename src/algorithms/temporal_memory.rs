@@ -4,12 +4,9 @@
 //! connections between cells. It predicts future states based on
 //! learned patterns.
 
-use crate::algorithms::{Connections, ConnectionsParams};
+use crate::algorithms::{AnomalyLikelihood, Connections, ConnectionsParams};
 use crate::error::{MokoshError, Result};
-use crate::types::{
-    CellIdx, Permanence, Real, Sdr, Segment, SegmentIdx, SynapseIdx, UInt, MAX_PERMANENCE,
-    MIN_PERMANENCE,
-};
+use crate::types::{CellIdx, Permanence, Real, Sdr, Segment, SegmentIdx, SynapseIdx, UInt};
 use crate::utils::Random;
 
 #[cfg(feature = "serde")]
@@ -20,12 +17,14 @@ use serde::{Deserialize, Serialize};
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub enum AnomalyMode {
     /// No anomaly computation.
-    #[default]
     Disabled,
     /// Raw anomaly score (fraction of unpredicted active columns).
+    #[default]
     Raw,
     /// Likelihood-based anomaly score.
     Likelihood,
+    /// Log-scaled anomaly likelihood.
+    LogLikelihood,
 }
 
 /// Parameters for creating a Temporal Memory.
@@ -38,7 +37,7 @@ pub struct TemporalMemoryParams {
     /// Number of cells per column.
     pub cells_per_column: UInt,
 
-    /// Radius of potential synapses for new segments.
+    /// Minimum active connected synapses required to activate a segment.
     pub activation_threshold: UInt,
 
     /// Initial permanence for new synapses.
@@ -77,7 +76,7 @@ pub struct TemporalMemoryParams {
     /// Use external predictive inputs for basal context.
     pub external_predictive_inputs: UInt,
 
-    /// Check presynaptic cell consistency when adding synapses.
+    /// Compatibility option. Typed SDR and external subset validation is always enforced.
     pub check_input_tm: bool,
 }
 
@@ -97,7 +96,7 @@ impl Default for TemporalMemoryParams {
             permanence_decrement: 0.1,
             predicted_segment_decrement: 0.0,
             seed: 42,
-            anomaly_mode: AnomalyMode::Disabled,
+            anomaly_mode: AnomalyMode::Raw,
             external_predictive_inputs: 0,
             check_input_tm: false,
         }
@@ -165,6 +164,7 @@ pub struct TemporalMemory {
 
     // Anomaly state
     anomaly: Real,
+    anomaly_likelihood: AnomalyLikelihood,
 
     // RNG
     rng: Random,
@@ -189,12 +189,54 @@ impl TemporalMemory {
             });
         }
 
-        let num_columns: usize = params
-            .column_dimensions
-            .iter()
-            .map(|&d| d as usize)
-            .product();
-        let num_cells = num_columns * params.cells_per_column as usize;
+        let num_columns = params.column_dimensions.iter().try_fold(1usize, |n, &d| {
+            n.checked_mul(d as usize)
+                .filter(|&v| d > 0 && v <= u32::MAX as usize)
+                .ok_or_else(|| {
+                    MokoshError::InvalidDimensions(
+                        "Column dimensions must be positive and fit u32".into(),
+                    )
+                })
+        })?;
+        let num_cells = num_columns
+            .checked_mul(params.cells_per_column as usize)
+            .filter(|&n| {
+                n.checked_add(params.external_predictive_inputs as usize)
+                    .is_some_and(|total| total <= u32::MAX as usize)
+            })
+            .ok_or_else(|| {
+                MokoshError::InvalidDimensions(
+                    "Cell and external input indices must fit u32".into(),
+                )
+            })?;
+        for (name, value) in [
+            ("initial_permanence", params.initial_permanence),
+            ("connected_permanence", params.connected_permanence),
+            ("permanence_increment", params.permanence_increment),
+            ("permanence_decrement", params.permanence_decrement),
+            (
+                "predicted_segment_decrement",
+                params.predicted_segment_decrement,
+            ),
+        ] {
+            if !value.is_finite() || !(0.0..=1.0).contains(&value) {
+                return Err(MokoshError::InvalidParameter {
+                    name,
+                    message: "Must be finite and in [0, 1]".into(),
+                });
+            }
+        }
+        if params.min_threshold == 0
+            || params.activation_threshold < params.min_threshold
+            || params.activation_threshold > u16::MAX as UInt
+            || params.max_new_synapse_count > u16::MAX as UInt
+            || params.max_synapses_per_segment == 0
+            || params.max_synapses_per_segment > u16::MAX as UInt
+            || params.max_segments_per_cell == 0
+            || params.max_segments_per_cell > u16::MAX as UInt
+        {
+            return Err(MokoshError::InvalidParameter { name: "thresholds/capacities", message: "Require 0 < min_threshold <= activation_threshold and positive 16-bit capacities".into() });
+        }
 
         Ok(Self {
             column_dimensions: params.column_dimensions,
@@ -228,7 +270,8 @@ impl TemporalMemory {
             matching_segments: Vec::new(),
             num_active_potential_synapses_for_segment: Vec::new(),
 
-            anomaly: 0.0,
+            anomaly: -1.0,
+            anomaly_likelihood: AnomalyLikelihood::default(),
             rng: Random::new(params.seed),
             iteration: 0,
         })
@@ -239,14 +282,59 @@ impl TemporalMemory {
     /// Given the active columns from the Spatial Pooler, computes the
     /// active and predictive cells.
     pub fn compute(&mut self, active_columns: &Sdr, learn: bool) {
+        assert_eq!(
+            self.external_predictive_inputs, 0,
+            "Use compute_with_external for external context"
+        );
+        self.compute_context(active_columns, learn, &[], &[]);
+    }
+
+    /// Computes with external context in the declared external input space.
+    /// External winners must be a subset of external active inputs.
+    pub fn compute_with_external(
+        &mut self,
+        active_columns: &Sdr,
+        learn: bool,
+        external_active: &Sdr,
+        external_winners: &Sdr,
+    ) {
+        assert_eq!(
+            external_active.size(),
+            self.external_predictive_inputs as usize
+        );
+        assert_eq!(external_winners.dimensions(), external_active.dimensions());
+        let active = external_active.get_sparse();
+        let winners = external_winners.get_sparse();
+        assert!(
+            winners.iter().all(|w| active.binary_search(w).is_ok()),
+            "External winners must be active"
+        );
+        self.compute_context(active_columns, learn, &active, &winners);
+    }
+
+    fn compute_context(
+        &mut self,
+        active_columns: &Sdr,
+        learn: bool,
+        external_active: &[UInt],
+        external_winners: &[UInt],
+    ) {
+        assert_eq!(
+            active_columns.dimensions(),
+            self.column_dimensions.as_slice(),
+            "Temporal Memory input dimensions differ"
+        );
         self.iteration += 1;
 
-        let prev_active_cells = std::mem::take(&mut self.active_cells);
-        let prev_winner_cells = std::mem::take(&mut self.winner_cells);
+        let mut prev_active_cells = std::mem::take(&mut self.active_cells);
+        let mut prev_winner_cells = std::mem::take(&mut self.winner_cells);
+        prev_active_cells.extend(external_active.iter().map(|&c| c + self.num_cells as UInt));
+        prev_winner_cells.extend(external_winners.iter().map(|&c| c + self.num_cells as UInt));
 
         // Compute activity
-        let (num_active_connected, num_active_potential) =
-            self.connections.compute_activity_full(&prev_active_cells, learn);
+        let (num_active_connected, num_active_potential) = self
+            .connections
+            .compute_activity_full(&prev_active_cells, learn);
 
         // Find active and matching segments
         self.active_segments.clear();
@@ -254,6 +342,9 @@ impl TemporalMemory {
         self.num_active_potential_synapses_for_segment = num_active_potential.clone();
 
         for segment in 0..self.connections.segment_flat_list_length() {
+            if !self.connections.segment_exists(segment as Segment) {
+                continue;
+            }
             if num_active_connected[segment] >= self.activation_threshold as SynapseIdx {
                 self.active_segments.push(segment as Segment);
             }
@@ -278,6 +369,8 @@ impl TemporalMemory {
         // Compute anomaly before activation
         if self.anomaly_mode != AnomalyMode::Disabled {
             self.compute_anomaly(&active_columns_sparse, &predictive_set);
+        } else {
+            self.anomaly = 0.5;
         }
 
         self.active_cells.clear();
@@ -294,24 +387,48 @@ impl TemporalMemory {
 
             if predicted_cells.is_empty() {
                 // Bursting - activate all cells
-                self.burst_column(column, &prev_winner_cells, learn);
+                self.burst_column(column, &prev_active_cells, &prev_winner_cells, learn);
             } else {
                 // Activate predicted cells
-                self.activate_predicted_column(column, &predicted_cells, &prev_winner_cells, learn);
+                self.activate_predicted_column(
+                    &predicted_cells,
+                    &prev_active_cells,
+                    &prev_winner_cells,
+                    learn,
+                );
             }
         }
 
         // Punish predicted segments in inactive columns
         if learn && self.predicted_segment_decrement > 0.0 {
-            self.punish_predicted_column(&active_columns_sparse);
+            self.punish_predicted_column(&active_columns_sparse, &prev_active_cells);
         }
+        // Public Rust getters describe the next prediction after this input.
+        // This corresponds to an explicit activateDendrites(false) in htm.core.
+        self.activate_dendrites();
+    }
+
+    /// Refreshes next-step predictions from the current active cells, without learning.
+    pub fn activate_dendrites(&mut self) {
+        let counts = self.connections.compute_activity(&self.active_cells, false);
+        self.predictive_cells = counts
+            .iter()
+            .enumerate()
+            .filter(|&(s, &n)| {
+                n >= self.activation_threshold as SynapseIdx
+                    && self.connections.segment_exists(s as Segment)
+            })
+            .map(|(s, _)| self.connections.cell_for_segment(s as Segment))
+            .collect();
+        self.predictive_cells.sort_unstable();
+        self.predictive_cells.dedup();
     }
 
     /// Activates cells in a column that was correctly predicted.
     fn activate_predicted_column(
         &mut self,
-        column: usize,
         predicted_cells: &[CellIdx],
+        prev_active_cells: &[CellIdx],
         prev_winner_cells: &[CellIdx],
         learn: bool,
     ) {
@@ -330,14 +447,32 @@ impl TemporalMemory {
                     .collect();
 
                 for segment in segments {
-                    self.adapt_segment(segment, prev_winner_cells, true);
+                    self.adapt_segment(
+                        segment,
+                        prev_active_cells,
+                        self.permanence_increment,
+                        self.permanence_decrement,
+                    );
+                    let active =
+                        self.num_active_potential_synapses_for_segment[segment as usize] as usize;
+                    self.grow_synapses(
+                        segment,
+                        prev_winner_cells,
+                        (self.max_new_synapse_count as usize).saturating_sub(active),
+                    );
                 }
             }
         }
     }
 
     /// Bursts a column (activates all cells when unpredicted).
-    fn burst_column(&mut self, column: usize, prev_winner_cells: &[CellIdx], learn: bool) {
+    fn burst_column(
+        &mut self,
+        column: usize,
+        prev_active_cells: &[CellIdx],
+        prev_winner_cells: &[CellIdx],
+        learn: bool,
+    ) {
         // Activate all cells in column
         for i in 0..self.cells_per_column {
             let cell = self.column_cell(column, i as usize);
@@ -352,15 +487,21 @@ impl TemporalMemory {
             let cell = self.connections.cell_for_segment(segment);
 
             if learn {
-                self.adapt_segment(segment, prev_winner_cells, true);
+                self.adapt_segment(
+                    segment,
+                    prev_active_cells,
+                    self.permanence_increment,
+                    self.permanence_decrement,
+                );
 
                 // Grow additional synapses
-                let num_active = self.num_active_potential_synapses_for_segment
+                let num_active = self
+                    .num_active_potential_synapses_for_segment
                     .get(segment as usize)
                     .copied()
                     .unwrap_or(0);
-                let new_synapse_count = (self.max_new_synapse_count as usize)
-                    .saturating_sub(num_active as usize);
+                let new_synapse_count =
+                    (self.max_new_synapse_count as usize).saturating_sub(num_active as usize);
 
                 if new_synapse_count > 0 {
                     self.grow_synapses(segment, prev_winner_cells, new_synapse_count);
@@ -370,14 +511,21 @@ impl TemporalMemory {
             cell
         } else {
             // No matching segment - pick least used cell and grow new segment
-            let cell = self.least_used_cell(column);
+            let cell = prev_winner_cells
+                .iter()
+                .copied()
+                .find(|&c| self.cell_column(c) == column)
+                .unwrap_or_else(|| self.least_used_cell(column));
 
-            if learn && !prev_winner_cells.is_empty() {
-                let segment = self.connections.create_segment(
-                    cell,
-                    Some(self.max_segments_per_cell as SegmentIdx),
+            if learn && !prev_winner_cells.is_empty() && self.max_new_synapse_count > 0 {
+                let segment = self
+                    .connections
+                    .create_segment(cell, Some(self.max_segments_per_cell as SegmentIdx));
+                self.grow_synapses(
+                    segment,
+                    prev_winner_cells,
+                    self.max_new_synapse_count as usize,
                 );
-                self.grow_synapses(segment, prev_winner_cells, self.max_new_synapse_count as usize);
             }
 
             cell
@@ -387,68 +535,51 @@ impl TemporalMemory {
     }
 
     /// Punishes segments that predicted incorrectly.
-    fn punish_predicted_column(&mut self, active_columns: &[u32]) {
-        let active_set: std::collections::HashSet<_> = active_columns.iter().copied().collect();
-
-        // Find predicted columns that weren't active
-        for &segment in &self.matching_segments {
+    fn punish_predicted_column(&mut self, active_columns: &[u32], prev_active_cells: &[CellIdx]) {
+        let segments = self.matching_segments.clone();
+        for segment in segments {
+            if !self.connections.segment_exists(segment) {
+                continue;
+            }
             let cell = self.connections.cell_for_segment(segment);
-            let column = self.cell_column(cell);
-
-            if !active_set.contains(&(column as u32)) {
-                // Punish this segment
-                let synapses: Vec<_> = self
-                    .connections
-                    .synapses_for_segment(segment)
-                    .iter()
-                    .copied()
-                    .collect();
-
-                for synapse in synapses {
-                    let data = self.connections.data_for_synapse(synapse);
-                    let new_perm =
-                        (data.permanence - self.predicted_segment_decrement).max(MIN_PERMANENCE);
-                    self.connections.update_synapse_permanence(synapse, new_perm);
-                }
+            let column = self.cell_column(cell) as u32;
+            if active_columns.binary_search(&column).is_err() {
+                self.adapt_segment(
+                    segment,
+                    prev_active_cells,
+                    -self.predicted_segment_decrement,
+                    0.0,
+                );
             }
         }
     }
 
-    /// Adapts a segment by adjusting permanences.
-    fn adapt_segment(&mut self, segment: Segment, active_cells: &[CellIdx], reinforce: bool) {
-        let active_set: std::collections::HashSet<_> = active_cells.iter().copied().collect();
-
-        let synapses: Vec<_> = self
-            .connections
-            .synapses_for_segment(segment)
-            .iter()
-            .copied()
-            .collect();
-
-        for synapse in synapses {
-            let data = self.connections.data_for_synapse(synapse);
-            let presynaptic = data.presynaptic_cell;
-            let old_perm = data.permanence;
-
-            let new_perm = if active_set.contains(&presynaptic) {
-                if reinforce {
-                    (old_perm + self.permanence_increment).min(MAX_PERMANENCE)
-                } else {
-                    old_perm
-                }
-            } else {
-                (old_perm - self.permanence_decrement).max(MIN_PERMANENCE)
-            };
-
-            if (new_perm - old_perm).abs() > 1e-6 {
-                self.connections.update_synapse_permanence(synapse, new_perm);
-            }
-        }
+    /// Applies the reference learning rule and prunes exhausted synapses/segments.
+    fn adapt_segment(
+        &mut self,
+        segment: Segment,
+        active_cells: &[CellIdx],
+        increment: Permanence,
+        decrement: Permanence,
+    ) {
+        let mut inputs =
+            Sdr::new(&[(self.num_cells + self.external_predictive_inputs as usize) as UInt]);
+        inputs
+            .set_sparse(active_cells)
+            .expect("Internal cell state must be sorted and valid");
+        self.connections.adapt_segment(
+            segment,
+            &inputs,
+            increment,
+            decrement,
+            true,
+            self.min_threshold,
+        );
     }
 
     /// Grows new synapses on a segment.
     fn grow_synapses(&mut self, segment: Segment, candidates: &[CellIdx], count: usize) {
-        if candidates.is_empty() || count == 0 {
+        if candidates.is_empty() || count == 0 || !self.connections.segment_exists(segment) {
             return;
         }
 
@@ -473,7 +604,8 @@ impl TemporalMemory {
 
             for &segment in self.connections.segments_for_cell(cell) {
                 if self.matching_segments.contains(&segment) {
-                    let score = self.num_active_potential_synapses_for_segment
+                    let score = self
+                        .num_active_potential_synapses_for_segment
                         .get(segment as usize)
                         .copied()
                         .unwrap_or(0);
@@ -512,12 +644,11 @@ impl TemporalMemory {
     }
 
     /// Computes the anomaly score.
-    fn compute_anomaly(&mut self, active_columns: &[u32], predicted_cells: &std::collections::HashSet<CellIdx>) {
-        if active_columns.is_empty() {
-            self.anomaly = 0.0;
-            return;
-        }
-
+    fn compute_anomaly(
+        &mut self,
+        active_columns: &[u32],
+        predicted_cells: &std::collections::HashSet<CellIdx>,
+    ) {
         // Count columns that had predicted cells
         let predicted_columns: std::collections::HashSet<_> = predicted_cells
             .iter()
@@ -529,7 +660,19 @@ impl TemporalMemory {
             .filter(|c| predicted_columns.contains(c))
             .count();
 
-        self.anomaly = 1.0 - (num_predicted_active as Real / active_columns.len() as Real);
+        let raw = if active_columns.is_empty() {
+            0.0
+        } else {
+            1.0 - (num_predicted_active as Real / active_columns.len() as Real)
+        };
+        self.anomaly = match self.anomaly_mode {
+            AnomalyMode::Likelihood => self.anomaly_likelihood.anomaly_probability(raw),
+            AnomalyMode::LogLikelihood => {
+                let probability = self.anomaly_likelihood.anomaly_probability(raw);
+                AnomalyLikelihood::compute_log_likelihood(probability)
+            }
+            _ => raw,
+        };
     }
 
     // ========================================================================
@@ -555,6 +698,8 @@ impl TemporalMemory {
         self.predictive_cells.clear();
         self.active_segments.clear();
         self.matching_segments.clear();
+        self.num_active_potential_synapses_for_segment.clear();
+        self.anomaly = -1.0;
         self.connections.reset();
     }
 
@@ -717,9 +862,8 @@ mod tests {
         tm.reset();
         tm.compute(&pattern_a, false);
 
-        // Should have some predictive cells
-        // (may or may not depending on learning success)
-        assert!(!tm.active_cells().is_empty());
+        let predicted_columns: Vec<_> = tm.predictive_cells().iter().map(|c| c / 4).collect();
+        assert_eq!(predicted_columns, vec![10, 11, 12, 13, 14]);
     }
 
     #[test]
@@ -782,5 +926,92 @@ mod tests {
         assert_eq!(tm.column_cell(0, 0), 0);
         assert_eq!(tm.column_cell(0, 3), 3);
         assert_eq!(tm.column_cell(1, 0), 4);
+    }
+
+    fn learning_fixture() -> TemporalMemory {
+        TemporalMemory::new(TemporalMemoryParams {
+            column_dimensions: vec![4],
+            cells_per_column: 3,
+            activation_threshold: 2,
+            min_threshold: 2,
+            max_new_synapse_count: 4,
+            initial_permanence: 0.5,
+            ..Default::default()
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn reference_reinforces_all_active_cells_not_only_winners() {
+        let mut tm = learning_fixture();
+        tm.active_cells = vec![0, 1, 2];
+        tm.winner_cells = vec![0];
+        let s = tm.connections.create_segment(3, None);
+        let synapses: Vec<_> = [0, 1, 2, 6]
+            .iter()
+            .map(|&c| tm.connections.create_synapse(s, c, 0.5))
+            .collect();
+        let mut input = Sdr::new(&[4]);
+        input.set_sparse(&[1]).unwrap();
+        tm.compute(&input, true);
+        for (i, syn) in synapses.into_iter().enumerate() {
+            let expected = if i < 3 { 0.6 } else { 0.4 };
+            assert!((tm.connections.data_for_synapse(syn).permanence - expected).abs() < 1e-6);
+        }
+    }
+
+    #[test]
+    fn reference_grows_correctly_predicted_segments() {
+        let mut tm = learning_fixture();
+        tm.active_cells = vec![0, 1, 2, 6];
+        tm.winner_cells = vec![0, 6];
+        let s = tm.connections.create_segment(3, None);
+        tm.connections.create_synapse(s, 0, 0.5);
+        tm.connections.create_synapse(s, 1, 0.5);
+        let mut input = Sdr::new(&[4]);
+        input.set_sparse(&[1]).unwrap();
+        tm.compute(&input, true);
+        assert_eq!(tm.connections.num_synapses_on_segment(s), 3);
+        assert!(tm.connections.presynaptic_cells_for_segment(s).contains(&6));
+    }
+
+    #[test]
+    fn reference_punishes_only_previously_active_presynaptic_cells() {
+        let mut tm = learning_fixture();
+        tm.predicted_segment_decrement = 0.1;
+        tm.active_cells = vec![0, 1];
+        tm.winner_cells = vec![0];
+        let s = tm.connections.create_segment(3, None);
+        let a = tm.connections.create_synapse(s, 0, 0.5);
+        tm.connections.create_synapse(s, 1, 0.5);
+        let inactive = tm.connections.create_synapse(s, 6, 0.5);
+        tm.compute(&Sdr::new(&[4]), true);
+        assert!((tm.connections.data_for_synapse(a).permanence - 0.4).abs() < 1e-6);
+        assert_eq!(tm.connections.data_for_synapse(inactive).permanence, 0.5);
+    }
+
+    #[test]
+    fn reference_prunes_exhausted_segments_and_does_not_resurrect_them() {
+        let mut tm = learning_fixture();
+        let s = tm.connections.create_segment(3, None);
+        tm.connections.create_synapse(s, 0, 0.05);
+        tm.connections.create_synapse(s, 1, 0.05);
+        tm.adapt_segment(s, &[], 0.1, 0.1);
+        assert!(!tm.connections.segment_exists(s));
+        tm.grow_synapses(s, &[0, 1], 2);
+        assert_eq!(tm.connections.num_synapses(), 0);
+    }
+
+    #[test]
+    fn reference_reuses_previous_winner_in_repeated_bursting_column() {
+        let mut tm = learning_fixture();
+        tm.active_cells = vec![0, 1, 2];
+        tm.winner_cells = vec![1];
+        let s = tm.connections.create_segment(1, None);
+        tm.connections.create_synapse(s, 6, 0.5);
+        let mut input = Sdr::new(&[4]);
+        input.set_sparse(&[0]).unwrap();
+        tm.compute(&input, false);
+        assert_eq!(tm.winner_cells(), &[1]);
     }
 }

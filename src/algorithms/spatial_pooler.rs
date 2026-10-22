@@ -165,7 +165,6 @@ pub struct SpatialPooler {
     iteration_learn_num: UInt,
 
     // Cached neighbor map for local inhibition
-    #[cfg_attr(feature = "serde", serde(skip))]
     neighbor_map: Neighborhood,
 
     // RNG
@@ -190,28 +189,86 @@ impl SpatialPooler {
                 message: "Cannot be empty".to_string(),
             });
         }
-        if params.potential_pct <= 0.0 || params.potential_pct > 1.0 {
+        if !params.potential_pct.is_finite()
+            || params.potential_pct <= 0.0
+            || params.potential_pct > 1.0
+        {
             return Err(MokoshError::InvalidParameter {
                 name: "potential_pct",
                 message: "Must be in range (0, 1]".to_string(),
             });
         }
-        if params.local_area_density <= 0.0 || params.local_area_density > 0.5 {
+        if params.num_active_columns_per_inh_area == 0
+            && (!params.local_area_density.is_finite()
+                || params.local_area_density <= 0.0
+                || params.local_area_density > 0.5)
+        {
             return Err(MokoshError::InvalidParameter {
                 name: "local_area_density",
                 message: "Must be in range (0, 0.5]".to_string(),
             });
         }
 
-        let num_inputs = Topology::num_elements(&params.input_dimensions);
-        let num_columns = Topology::num_elements(&params.column_dimensions);
+        if params.input_dimensions.len() != params.column_dimensions.len() {
+            return Err(MokoshError::InvalidDimensions(
+                "Input and column ranks must match".into(),
+            ));
+        }
+        let size = |dims: &[UInt]| -> Result<usize> {
+            dims.iter().try_fold(1usize, |n, &d| {
+                n.checked_mul(d as usize)
+                    .filter(|&v| d > 0 && v <= u32::MAX as usize)
+                    .ok_or_else(|| {
+                        MokoshError::InvalidDimensions(
+                            "Dimensions must be positive and fit u32".into(),
+                        )
+                    })
+            })
+        };
+        let num_inputs = size(&params.input_dimensions)?;
+        let num_columns = size(&params.column_dimensions)?;
+        for (name, value) in [
+            ("syn_perm_connected", params.syn_perm_connected),
+            ("syn_perm_active_inc", params.syn_perm_active_inc),
+            ("syn_perm_inactive_dec", params.syn_perm_inactive_dec),
+            (
+                "min_pct_overlap_duty_cycles",
+                params.min_pct_overlap_duty_cycles,
+            ),
+        ] {
+            if !value.is_finite() || !(0.0..=1.0).contains(&value) {
+                return Err(MokoshError::InvalidParameter {
+                    name,
+                    message: "Must be finite and in [0, 1]".into(),
+                });
+            }
+        }
+        if params.duty_cycle_period == 0
+            || !params.boost_strength.is_finite()
+            || params.boost_strength < 0.0
+        {
+            return Err(MokoshError::InvalidParameter {
+                name: "duty_cycle_period/boost_strength",
+                message: "Period must be positive; boost must be finite and nonnegative".into(),
+            });
+        }
+        // Overlap counters use the reference 16-bit SynapseIdx type.
+        let potential_area = params.input_dimensions.iter().fold(1u64, |n, &d| {
+            n.saturating_mul(u64::from(d).min(2 * u64::from(params.potential_radius) + 1))
+        });
+        if (potential_area as f64 * f64::from(params.potential_pct)).round() > u16::MAX as f64 {
+            return Err(MokoshError::InvalidParameter {
+                name: "potential_radius/potential_pct",
+                message: "Potential pool exceeds 16-bit overlap capacity".into(),
+            });
+        }
 
         let mut sp = Self {
             input_dimensions: params.input_dimensions.clone(),
             column_dimensions: params.column_dimensions.clone(),
             num_inputs,
             num_columns,
-            potential_radius: params.potential_radius,
+            potential_radius: params.potential_radius.min(num_inputs as UInt),
             potential_pct: params.potential_pct,
             global_inhibition: params.global_inhibition,
             local_area_density: params.local_area_density,
@@ -292,6 +349,8 @@ impl SpatialPooler {
                 self.connections
                     .create_synapse(segment, input as CellIdx, perm);
             }
+            self.connections
+                .raise_permanences_to_threshold(segment, self.stimulus_threshold);
         }
 
         Ok(())
@@ -321,10 +380,11 @@ impl SpatialPooler {
 
         // Sample potential_pct of the neighborhood
         let num_potential = ((neighborhood.len() as Real) * self.potential_pct).round() as usize;
-        let num_potential = num_potential.max(1);
 
         let sampled = self.rng.sample(neighborhood, num_potential);
-        sampled.into_iter().map(|i| i as UInt).collect()
+        let mut sampled: Vec<_> = sampled.into_iter().map(|i| i as UInt).collect();
+        sampled.sort_unstable();
+        sampled
     }
 
     /// Initializes permanences for a potential pool.
@@ -344,13 +404,14 @@ impl SpatialPooler {
     /// Returns a random permanence for a connected synapse.
     fn init_perm_connected(&mut self) -> Permanence {
         let p = self.syn_perm_connected
-            + (self.rng.get_real32() * self.syn_perm_active_inc / 4.0);
+            + (f64::from(MAX_PERMANENCE - self.syn_perm_connected) * self.rng.get_real64())
+                as Permanence;
         p.min(MAX_PERMANENCE)
     }
 
     /// Returns a random permanence for a non-connected synapse.
     fn init_perm_non_connected(&mut self) -> Permanence {
-        let p = self.syn_perm_connected * self.rng.get_real32();
+        let p = (f64::from(self.syn_perm_connected) * self.rng.get_real64()) as Permanence;
         p.max(MIN_PERMANENCE)
     }
 
@@ -359,17 +420,29 @@ impl SpatialPooler {
     /// Takes an input SDR and produces an output SDR of active columns.
     /// If learning is enabled, also updates permanences and duty cycles.
     pub fn compute(&mut self, input: &Sdr, learn: bool, output: &mut Sdr) -> Vec<SynapseIdx> {
+        assert_eq!(
+            input.dimensions(),
+            self.input_dimensions.as_slice(),
+            "Spatial Pooler input dimensions differ"
+        );
+        assert_eq!(
+            output.dimensions(),
+            self.column_dimensions.as_slice(),
+            "Spatial Pooler output dimensions differ"
+        );
         self.update_bookkeeping_vars(learn);
 
         // Calculate overlaps
         let overlaps = self.calculate_overlaps(input);
 
         // Apply boosting
-        self.boost_overlaps(&overlaps, &mut self.boosted_overlaps.clone());
-        let boosted = self.boosted_overlaps.clone();
+        let mut boosted = std::mem::take(&mut self.boosted_overlaps);
+        self.boost_overlaps(&overlaps, &mut boosted);
+        self.boosted_overlaps = boosted;
 
         // Inhibition
-        let active_columns = self.inhibit_columns(&boosted);
+        let mut active_columns = self.inhibit_columns(&self.boosted_overlaps);
+        active_columns.sort_unstable();
 
         // Set output SDR
         let sparse: Vec<u32> = active_columns.iter().map(|&c| c as u32).collect();
@@ -393,7 +466,8 @@ impl SpatialPooler {
 
     /// Calculates overlap scores for all columns.
     fn calculate_overlaps(&self, input: &Sdr) -> Vec<SynapseIdx> {
-        let active_inputs: Vec<CellIdx> = input.get_sparse().iter().map(|&i| i as CellIdx).collect();
+        let active_inputs: Vec<CellIdx> =
+            input.get_sparse().iter().map(|&i| i as CellIdx).collect();
 
         let mut overlaps = vec![0u16; self.num_columns];
 
@@ -403,7 +477,7 @@ impl SpatialPooler {
 
             for synapse in synapses {
                 let synapse_data = self.connections.data_for_synapse(synapse);
-                if synapse_data.permanence >= self.syn_perm_connected {
+                if synapse_data.permanence >= self.connections.connected_threshold() {
                     let segment = synapse_data.segment;
                     let column = self.connections.cell_for_segment(segment);
                     overlaps[column as usize] += 1;
@@ -439,13 +513,14 @@ impl SpatialPooler {
                 }
                 area
             };
-            (self.num_active_columns_per_inh_area as Real / inhibition_area as Real)
-                .min(0.5)
+            (self.num_active_columns_per_inh_area as Real / inhibition_area as Real).min(0.5)
         } else {
             self.local_area_density
         };
 
-        if self.global_inhibition {
+        if self.global_inhibition
+            || self.inhibition_radius > *self.column_dimensions.iter().max().unwrap()
+        {
             self.inhibit_columns_global(overlaps, density)
         } else {
             self.inhibit_columns_local(overlaps, density)
@@ -454,7 +529,7 @@ impl SpatialPooler {
 
     /// Global inhibition: select top columns from entire region.
     fn inhibit_columns_global(&self, overlaps: &[Real], density: Real) -> Vec<CellIdx> {
-        let num_active = ((self.num_columns as Real) * density).round() as usize;
+        let num_active = ((self.num_columns as Real) * density) as usize;
         let num_active = num_active.max(1).min(self.num_columns);
 
         // Get columns sorted by overlap (descending)
@@ -464,7 +539,7 @@ impl SpatialPooler {
             .map(|(i, &o)| (i as CellIdx, o))
             .collect();
 
-        columns.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+        columns.sort_by(|a, b| b.1.total_cmp(&a.1).then(b.0.cmp(&a.0)));
 
         // Select top columns above stimulus threshold
         columns
@@ -478,6 +553,7 @@ impl SpatialPooler {
     /// Local inhibition: compete within neighborhoods.
     fn inhibit_columns_local(&self, overlaps: &[Real], density: Real) -> Vec<CellIdx> {
         let mut active = Vec::new();
+        let mut already_used = vec![false; self.num_columns];
 
         for column in 0..self.num_columns {
             let overlap = overlaps[column];
@@ -495,14 +571,15 @@ impl SpatialPooler {
             // Count neighbors with higher overlap
             let num_higher: usize = neighbors
                 .iter()
-                .filter(|&&n| overlaps[n] > overlap)
+                .filter(|&&n| overlaps[n] > overlap || (overlaps[n] == overlap && already_used[n]))
                 .count();
 
             // Calculate max active in neighborhood
-            let max_active = ((neighbors.len() + 1) as Real * density).ceil() as usize;
+            let max_active = (0.5 + (neighbors.len() + 1) as Real * density) as usize;
 
             if num_higher < max_active {
                 active.push(column as CellIdx);
+                already_used[column] = true;
             }
         }
 
@@ -535,16 +612,19 @@ impl SpatialPooler {
                     (old_perm - self.syn_perm_inactive_dec).max(MIN_PERMANENCE)
                 };
 
-                if (new_perm - old_perm).abs() > 1e-6 {
-                    self.connections.update_synapse_permanence(synapse, new_perm);
+                if new_perm != old_perm {
+                    self.connections
+                        .update_synapse_permanence(synapse, new_perm);
                 }
             }
+            self.connections
+                .raise_permanences_to_threshold(segment, self.stimulus_threshold);
         }
     }
 
     /// Updates duty cycles using SIMD-accelerated operations.
     fn update_duty_cycles(&mut self, overlaps: &[SynapseIdx], active: &Sdr) {
-        let period = self.duty_cycle_period as Real;
+        let period = self.duty_cycle_period.min(self.iteration_num) as Real;
 
         // Update overlap duty cycles using SIMD
         simd::update_duty_cycles_from_overlaps(&mut self.overlap_duty_cycles, overlaps, period);
@@ -573,22 +653,27 @@ impl SpatialPooler {
         }
     }
 
-    /// Updates boost factors based on active duty cycles using SIMD-accelerated exp.
+    /// Updates boost factors using reference-accurate exponentials.
     fn update_boost_factors(&mut self) {
         if self.boost_strength <= 0.0 {
             return;
         }
 
-        let target_density = self.local_area_density;
+        let target_density = if self.num_active_columns_per_inh_area > 0 {
+            let area = self.column_dimensions.iter().fold(1u64, |n, &d| {
+                n * u64::from(d).min(2 * u64::from(self.inhibition_radius) + 1)
+            });
+            (self.num_active_columns_per_inh_area as Real / area as Real).min(0.5)
+        } else {
+            self.local_area_density
+        };
 
         if self.global_inhibition {
-            // Use SIMD-accelerated boost factor computation
-            simd::compute_boost_factors(
-                &self.active_duty_cycles,
-                &mut self.boost_factors,
-                target_density,
-                self.boost_strength,
-            );
+            // Exact exponentials preserve reference column rankings and the
+            // neutral factor 1 at target density.
+            for (boost, &duty) in self.boost_factors.iter_mut().zip(&self.active_duty_cycles) {
+                *boost = (self.boost_strength * (target_density - duty)).exp();
+            }
         } else {
             // Local boosting based on neighborhood average
             // This is harder to SIMD-accelerate due to variable neighborhood sizes
@@ -601,11 +686,12 @@ impl SpatialPooler {
                 let neighbor_avg: Real = neighbors
                     .iter()
                     .map(|&n| self.active_duty_cycles[n])
-                    .sum::<Real>()
-                    / neighbors.len().max(1) as Real;
+                    .sum::<Real>();
+                let neighbor_avg = (neighbor_avg + self.active_duty_cycles[column])
+                    / (neighbors.len() + 1) as Real;
 
                 self.boost_factors[column] =
-                    simd::fast_exp_f32(self.boost_strength * (neighbor_avg - self.active_duty_cycles[column]));
+                    (self.boost_strength * (neighbor_avg - self.active_duty_cycles[column])).exp();
             }
         }
     }
@@ -628,8 +714,7 @@ impl SpatialPooler {
         // Calculate average columns per input
         let avg_columns_per_input = self.avg_columns_per_input();
 
-        self.inhibition_radius =
-            ((avg_span * avg_columns_per_input - 1.0) / 2.0).round() as UInt;
+        self.inhibition_radius = ((avg_span * avg_columns_per_input - 1.0) / 2.0).round() as UInt;
         self.inhibition_radius = self.inhibition_radius.max(1);
 
         // Update neighbor map
@@ -658,7 +743,7 @@ impl SpatialPooler {
             .iter()
             .filter_map(|&s| {
                 let data = self.connections.data_for_synapse(s);
-                if data.permanence >= self.syn_perm_connected {
+                if data.permanence >= self.syn_perm_connected + crate::types::EPSILON {
                     Some(data.presynaptic_cell)
                 } else {
                     None
@@ -675,7 +760,6 @@ impl SpatialPooler {
         let mut total_span = 0.0;
 
         for dim in 0..num_dims {
-            let dim_size = self.input_dimensions[dim] as usize;
             let coords: Vec<UInt> = connected
                 .iter()
                 .map(|&c| Topology::index_to_coordinates(c as usize, &self.input_dimensions)[dim])
@@ -691,21 +775,26 @@ impl SpatialPooler {
 
     /// Calculates average columns per input.
     fn avg_columns_per_input(&self) -> Real {
-        let num_dims = self.column_dimensions.len().max(self.input_dimensions.len());
-        let mut ratio = 1.0;
+        let num_dims = self
+            .column_dimensions
+            .len()
+            .max(self.input_dimensions.len());
+        let mut ratio = 0.0;
 
         for dim in 0..num_dims {
             let col_dim = self.column_dimensions.get(dim).copied().unwrap_or(1) as Real;
             let inp_dim = self.input_dimensions.get(dim).copied().unwrap_or(1) as Real;
-            ratio *= col_dim / inp_dim;
+            ratio += col_dim / inp_dim;
         }
 
-        ratio
+        ratio / num_dims as Real
     }
 
     /// Updates minimum duty cycles.
     fn update_min_duty_cycles(&mut self) {
-        if self.global_inhibition {
+        if self.global_inhibition
+            || self.inhibition_radius >= *self.column_dimensions.iter().max().unwrap()
+        {
             self.update_min_duty_cycles_global();
         } else {
             self.update_min_duty_cycles_local();
@@ -735,7 +824,7 @@ impl SpatialPooler {
             let max_neighbor_overlap = neighbors
                 .iter()
                 .map(|&n| self.overlap_duty_cycles[n])
-                .fold(0.0_f32, Real::max);
+                .fold(self.overlap_duty_cycles[column], Real::max);
 
             self.min_overlap_duty_cycles[column] =
                 self.min_pct_overlap_duty_cycles * max_neighbor_overlap;

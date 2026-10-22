@@ -112,7 +112,10 @@ pub struct ScalarEncoder {
 impl ScalarEncoder {
     /// Creates a new Scalar Encoder.
     pub fn new(params: ScalarEncoderParams) -> Result<Self> {
-        if params.maximum <= params.minimum {
+        if !params.minimum.is_finite()
+            || !params.maximum.is_finite()
+            || params.maximum <= params.minimum
+        {
             return Err(MokoshError::InvalidParameter {
                 name: "maximum",
                 message: "Maximum must be greater than minimum".to_string(),
@@ -126,20 +129,59 @@ impl ScalarEncoder {
             });
         }
 
+        if !params.radius.is_finite() || params.radius < 0.0 {
+            return Err(MokoshError::InvalidParameter {
+                name: "radius",
+                message: "Must be finite and nonnegative".into(),
+            });
+        }
+        if params.category
+            && (params.periodic
+                || params.minimum < 0.0
+                || params.minimum.fract() != 0.0
+                || params.maximum.fract() != 0.0)
+        {
+            return Err(MokoshError::InvalidParameter {
+                name: "category",
+                message: "Requires nonnegative integral bounds and nonperiodic encoding".into(),
+            });
+        }
         let range = params.maximum - params.minimum;
+        if !range.is_finite() {
+            return Err(MokoshError::InvalidParameter {
+                name: "range",
+                message: "Range must be finite".into(),
+            });
+        }
         let half_width = params.active_bits / 2;
 
         // Calculate resolution and size
         let (size, resolution) = if params.category {
             // For categories, each value is a distinct bucket
             let num_categories = (range + 1.0) as UInt;
-            let size = num_categories + params.active_bits - 1;
-            let resolution = 1.0;
+            let size = num_categories
+                .checked_mul(params.active_bits)
+                .ok_or_else(|| MokoshError::InvalidParameter {
+                    name: "size",
+                    message: "Category size overflow".into(),
+                })?;
+            let resolution = 1.0 / params.active_bits as Real;
             (size, resolution)
         } else if params.radius > 0.0 {
             // Compute from radius
             let resolution = params.radius / params.active_bits as Real;
-            let num_buckets = (range / resolution).ceil() as UInt;
+            let bands = (f64::from(range) / f64::from(resolution)).floor() + 1.0;
+            if bands > (u32::MAX - params.active_bits) as f64 {
+                return Err(MokoshError::InvalidParameter {
+                    name: "size",
+                    message: "Encoder size overflow".into(),
+                });
+            }
+            let num_buckets = if params.periodic {
+                (range / resolution).ceil() as UInt
+            } else {
+                bands as UInt
+            };
             let size = if params.periodic {
                 num_buckets
             } else {
@@ -148,7 +190,7 @@ impl ScalarEncoder {
             (size, resolution)
         } else if params.size > 0 {
             // Check size vs active_bits before computing num_buckets to avoid overflow
-            if params.size < params.active_bits {
+            if params.size <= params.active_bits {
                 return Err(MokoshError::InvalidParameter {
                     name: "size",
                     message: "Size must be >= active_bits".to_string(),
@@ -160,7 +202,12 @@ impl ScalarEncoder {
             } else {
                 params.size - params.active_bits + 1
             };
-            let resolution = range / num_buckets as Real;
+            let resolution = range
+                / if params.periodic {
+                    num_buckets
+                } else {
+                    num_buckets - 1
+                } as Real;
             (params.size, resolution)
         } else {
             return Err(MokoshError::InvalidParameter {
@@ -205,14 +252,17 @@ impl ScalarEncoder {
         resolution: Real,
         active_bits: UInt,
     ) -> Result<Self> {
-        let range = maximum - minimum;
-        let num_buckets = (range / resolution).ceil() as UInt;
-        let size = num_buckets + active_bits - 1;
-
+        if !resolution.is_finite() || resolution <= 0.0 {
+            return Err(MokoshError::InvalidParameter {
+                name: "resolution",
+                message: "Must be finite and positive".into(),
+            });
+        }
         Self::new(ScalarEncoderParams {
             minimum,
             maximum,
-            size,
+            size: 0,
+            radius: resolution * active_bits as Real,
             active_bits,
             ..Default::default()
         })
@@ -220,33 +270,19 @@ impl ScalarEncoder {
 
     /// Returns the bucket index for a value.
     pub fn bucket_index(&self, value: Real) -> UInt {
-        let mut value = value;
-
-        // Handle out-of-range values
-        if value < self.minimum {
-            if self.periodic {
-                // Wrap below minimum
-                let span = value - self.minimum;
-                value = self.maximum + (span % self.range);
-            } else if self.clip_input {
-                value = self.minimum;
-            }
-        } else if self.periodic && value >= self.maximum {
-            // For periodic, max wraps to min (360 degrees == 0 degrees)
-            let span = value - self.minimum;
-            value = self.minimum + (span % self.range);
-        } else if value > self.maximum {
-            if self.clip_input {
-                value = self.maximum;
-            }
+        let value = if self.periodic {
+            self.minimum + (value - self.minimum).rem_euclid(self.range)
+        } else if self.clip_input {
+            value.clamp(self.minimum, self.maximum)
+        } else {
+            value
+        };
+        let bucket = ((value - self.minimum) / self.resolution).round() as UInt;
+        if self.periodic {
+            bucket % self.num_buckets
+        } else {
+            bucket.min(self.num_buckets - 1)
         }
-
-        // Normalize to [0, 1)
-        let normalized = (value - self.minimum) / self.range;
-
-        // Map to bucket - clamp to valid range
-        let bucket = (normalized * self.num_buckets as Real).floor() as UInt;
-        bucket.min(self.num_buckets - 1)
     }
 
     /// Returns the minimum value.
@@ -292,14 +328,27 @@ impl Encoder<Real> for ScalarEncoder {
             });
         }
 
+        if value.is_nan() {
+            output.zero();
+            return Ok(());
+        }
+        if !value.is_finite()
+            || (!self.periodic
+                && !self.clip_input
+                && (value < self.minimum || value > self.maximum))
+            || (self.category
+                && (value < self.minimum || value > self.maximum || value.fract() != 0.0))
+        {
+            return Err(MokoshError::InvalidParameter {
+                name: "value",
+                message: "Input must be finite and satisfy encoder bounds/category constraints"
+                    .into(),
+            });
+        }
         let bucket = self.bucket_index(value);
 
         // Calculate start position
-        let start = if self.periodic {
-            bucket
-        } else {
-            bucket
-        };
+        let start = if self.periodic { bucket } else { bucket };
 
         // Generate active bits
         let mut sparse = Vec::with_capacity(self.active_bits as usize);

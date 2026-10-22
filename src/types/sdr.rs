@@ -107,8 +107,10 @@ mod serde_impl {
             D: Deserializer<'de>,
         {
             let state = SdrState::deserialize(deserializer)?;
+            Sdr::checked_size(&state.dimensions).map_err(serde::de::Error::custom)?;
             let mut sdr = Sdr::new(&state.dimensions);
-            sdr.set_sparse_unchecked(state.sparse);
+            sdr.set_sparse_owned(state.sparse)
+                .map_err(serde::de::Error::custom)?;
             Ok(sdr)
         }
     }
@@ -136,16 +138,7 @@ impl Sdr {
     /// ```
     #[must_use]
     pub fn new(dimensions: &[UInt]) -> Self {
-        assert!(!dimensions.is_empty(), "Dimensions cannot be empty");
-
-        let size: usize = dimensions.iter().map(|&d| d as usize).product();
-
-        // Allow size 0 for placeholder SDRs
-        for (i, &dim) in dimensions.iter().enumerate() {
-            if dim == 0 && dimensions.len() > 1 {
-                panic!("Dimension {} cannot be zero in multi-dimensional SDR", i);
-            }
-        }
+        let size = Self::checked_size(dimensions).expect("Invalid SDR dimensions");
 
         Self {
             dimensions: dimensions.to_vec(),
@@ -154,6 +147,19 @@ impl Sdr {
             callbacks: RefCell::new(Vec::new()),
             destroy_callbacks: RefCell::new(Vec::new()),
         }
+    }
+
+    fn checked_size(dimensions: &[UInt]) -> Result<usize> {
+        if dimensions.is_empty() || (dimensions.len() > 1 && dimensions.contains(&0)) {
+            return Err(MokoshError::InvalidDimensions(
+                "Use positive dimensions or the [0] placeholder".into(),
+            ));
+        }
+        dimensions.iter().try_fold(1usize, |n, &d| {
+            n.checked_mul(d as usize)
+                .filter(|&v| v <= u32::MAX as usize)
+                .ok_or_else(|| MokoshError::InvalidDimensions("SDR size must fit u32".into()))
+        })
     }
 
     /// Creates a new SDR with dimensions initialized from an iterator.
@@ -192,7 +198,7 @@ impl Sdr {
     ///
     /// Returns an error if the new dimensions have a different total size.
     pub fn reshape(&mut self, new_dimensions: &[UInt]) -> Result<()> {
-        let new_size: usize = new_dimensions.iter().map(|&d| d as usize).product();
+        let new_size = Self::checked_size(new_dimensions)?;
 
         if new_size != self.size {
             return Err(MokoshError::InvalidDimensions(format!(
@@ -218,14 +224,6 @@ impl Sdr {
         drop(cache);
 
         self.do_callbacks();
-    }
-
-    /// Clears all cached representations.
-    fn clear_cache(&self) {
-        let mut cache = self.cache.borrow_mut();
-        cache.dense = None;
-        cache.sparse = None;
-        cache.coordinates = None;
     }
 
     /// Invokes all registered callbacks.
@@ -502,7 +500,7 @@ impl Sdr {
         }
 
         // Validate bounds
-        for (dim_idx, (coords, &dim_size)) in coordinates.iter().zip(&self.dimensions).enumerate() {
+        for (coords, &dim_size) in coordinates.iter().zip(&self.dimensions) {
             for &c in coords {
                 if c >= dim_size {
                     return Err(MokoshError::IndexOutOfBounds {
@@ -513,14 +511,9 @@ impl Sdr {
             }
         }
 
-        let mut cache = self.cache.borrow_mut();
-        cache.coordinates = Some(coordinates.clone());
-        cache.dense = None;
-        cache.sparse = None;
-        drop(cache);
-
-        self.do_callbacks();
-        Ok(())
+        // Canonicalize duplicates and ordering once so all representations
+        // describe the same set of bits.
+        self.set_sparse_owned(self.coordinates_to_sparse(coordinates))
     }
 
     /// Gets the coordinate representation of the SDR.
@@ -694,6 +687,10 @@ impl Sdr {
     /// * `sparsity` - Fraction of bits to set active (0.0 to 1.0)
     /// * `rng` - Random number generator
     pub fn randomize(&mut self, sparsity: Real, rng: &mut Random) {
+        assert!(
+            sparsity.is_finite() && (0.0..=1.0).contains(&sparsity),
+            "Sparsity must be in [0, 1]"
+        );
         let num_active = ((self.size as Real) * sparsity).round() as usize;
 
         if num_active == 0 {
@@ -732,6 +729,10 @@ impl Sdr {
     /// * `fraction_noise` - Fraction of active bits to move (0.0 to 1.0)
     /// * `rng` - Random number generator
     pub fn add_noise(&mut self, fraction_noise: Real, rng: &mut Random) {
+        assert!(
+            fraction_noise.is_finite() && (0.0..=1.0).contains(&fraction_noise),
+            "Noise must be in [0, 1]"
+        );
         let sparse = self.get_sparse();
         let num_active = sparse.len();
 
@@ -739,7 +740,8 @@ impl Sdr {
             return;
         }
 
-        let num_to_flip = ((num_active as Real) * fraction_noise).round() as usize;
+        let num_to_flip =
+            (((num_active as Real) * fraction_noise).round() as usize).min(self.size - num_active);
         if num_to_flip == 0 {
             return;
         }
@@ -883,38 +885,45 @@ impl Sdr {
             });
         }
 
-        // Verify all inputs have compatible dimensions
-        let num_dims = inputs[0].num_dimensions();
-        for (i, input) in inputs.iter().enumerate() {
-            if input.num_dimensions() != num_dims {
-                return Err(MokoshError::InvalidDimensions(format!(
-                    "Input {} has {} dimensions, expected {}",
-                    i,
-                    input.num_dimensions(),
-                    num_dims
-                )));
-            }
+        let num_dims = self.num_dimensions();
+        if axis >= num_dims {
+            return Err(MokoshError::InvalidDimensions(
+                "Concatenation axis out of range".into(),
+            ));
         }
-
-        // Compute output sparse representation
-        let mut result = Vec::new();
-        let mut offset: usize = 0;
-
+        let mut total_axis = 0usize;
         for input in inputs {
-            let sparse = input.get_sparse();
-            for &idx in &sparse {
-                result.push((idx as usize + offset) as ElemSparse);
+            if input.num_dimensions() != num_dims
+                || (0..num_dims).any(|d| d != axis && input.dimensions[d] != self.dimensions[d])
+            {
+                return Err(MokoshError::InvalidDimensions(
+                    "Non-concatenated dimensions must match".into(),
+                ));
             }
-            offset += input.size();
+            total_axis += input.dimensions[axis] as usize;
         }
-
-        // Verify result fits in this SDR
-        if offset != self.size {
-            return Err(MokoshError::DimensionMismatch {
-                expected: vec![self.size as u32],
-                actual: vec![offset as u32],
-            });
+        if total_axis != self.dimensions[axis] as usize {
+            return Err(MokoshError::InvalidDimensions(
+                "Concatenated dimensions must match output".into(),
+            ));
         }
+        let mut result = Vec::new();
+        let mut offset = 0;
+        for input in inputs {
+            for index in input.get_sparse() {
+                let mut coord = crate::utils::Topology::index_to_coordinates(
+                    index as usize,
+                    input.dimensions(),
+                );
+                coord[axis] += offset;
+                result.push(
+                    crate::utils::Topology::coordinates_to_index(&coord, &self.dimensions)
+                        as ElemSparse,
+                );
+            }
+            offset += input.dimensions[axis];
+        }
+        result.sort_unstable();
 
         self.set_sparse_unchecked(result);
         Ok(())
@@ -971,7 +980,7 @@ impl Sdr {
 
 impl Clone for Sdr {
     fn clone(&self) -> Self {
-        let mut new_sdr = Self::new(&self.dimensions);
+        let new_sdr = Self::new(&self.dimensions);
 
         // Copy the most efficient representation available
         let cache = self.cache.borrow();
@@ -1084,7 +1093,8 @@ mod tests {
     #[test]
     fn test_coordinates() {
         let mut sdr = Sdr::new(&[3, 3]);
-        sdr.set_coordinates(&vec![vec![0, 1, 2], vec![1, 1, 2]]).unwrap();
+        sdr.set_coordinates(&vec![vec![0, 1, 2], vec![1, 1, 2]])
+            .unwrap();
         assert_eq!(sdr.get_sparse(), vec![1, 4, 8]);
 
         sdr.set_sparse(&[1, 4, 8]).unwrap();

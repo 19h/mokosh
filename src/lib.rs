@@ -53,14 +53,10 @@
 #![allow(clippy::module_name_repetitions)]
 #![allow(clippy::must_use_candidate)]
 #![allow(clippy::similar_names)]
-#![cfg_attr(not(feature = "std"), no_std)]
 
-#[cfg(not(feature = "std"))]
-extern crate alloc;
-
-pub mod types;
 pub mod algorithms;
 pub mod encoders;
+pub mod types;
 pub mod utils;
 
 #[cfg(feature = "serde")]
@@ -68,28 +64,20 @@ pub mod serialization;
 
 /// Re-export of commonly used types and traits for convenience.
 pub mod prelude {
-    pub use crate::types::{
-        Sdr, SdrDense, SdrSparse, SdrCoordinate,
-        CellIdx, SegmentIdx, SynapseIdx, Segment, Synapse, Permanence,
-        Real, Real32, Real64, UInt, UInt16, UInt32, UInt64, Int, Int32, Int64,
-    };
     pub use crate::algorithms::{
-        SpatialPooler, SpatialPoolerParams,
-        TemporalMemory, TemporalMemoryParams, AnomalyMode,
-        Connections, ConnectionsParams,
-        Anomaly, AnomalyLikelihood,
-        SdrClassifier, SdrClassifierParams,
+        Anomaly, AnomalyLikelihood, AnomalyMode, Connections, ConnectionsParams, SdrClassifier,
+        SdrClassifierParams, SpatialPooler, SpatialPoolerParams, TemporalMemory,
+        TemporalMemoryParams,
     };
     pub use crate::encoders::{
-        Encoder,
+        DateEncoder, DateEncoderParams, Encoder, RandomDistributedScalarEncoder, RdseParams,
         ScalarEncoder, ScalarEncoderParams,
-        RandomDistributedScalarEncoder, RdseParams,
-        DateEncoder, DateEncoderParams,
     };
-    pub use crate::utils::{
-        Random,
-        Topology, WrappingMode,
+    pub use crate::types::{
+        CellIdx, Int, Int32, Int64, Permanence, Real, Real32, Real64, Sdr, SdrCoordinate, SdrDense,
+        SdrSparse, Segment, SegmentIdx, Synapse, SynapseIdx, UInt, UInt16, UInt32, UInt64,
     };
+    pub use crate::utils::{Random, Topology, WrappingMode};
 
     #[cfg(feature = "serde")]
     pub use crate::serialization::{Serializable, SerializableFormat};

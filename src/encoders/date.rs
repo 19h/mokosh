@@ -183,14 +183,15 @@ pub struct DateTime {
 
 impl DateTime {
     /// Creates a DateTime from components.
-    pub fn new(
-        year: i32,
-        month: u32,
-        day: u32,
-        hour: u32,
-        minute: u32,
-        second: u32,
-    ) -> Self {
+    pub fn new(year: i32, month: u32, day: u32, hour: u32, minute: u32, second: u32) -> Self {
+        assert!(
+            (1..=12).contains(&month) && (1..=Self::days_in_month(year, month)).contains(&day),
+            "Invalid Gregorian date"
+        );
+        assert!(
+            hour < 24 && minute < 60 && second < 60,
+            "Invalid civil time"
+        );
         let day_of_year = Self::compute_day_of_year(year, month, day);
         let day_of_week = Self::compute_day_of_week(year, month, day);
         Self {
@@ -208,8 +209,8 @@ impl DateTime {
     /// Creates a DateTime from a Unix timestamp (seconds since epoch).
     pub fn from_timestamp(timestamp: i64) -> Self {
         // Simple timestamp conversion (no timezone handling)
-        let days_since_epoch = timestamp / 86400;
-        let time_in_day = (timestamp % 86400) as u32;
+        let days_since_epoch = timestamp.div_euclid(86400);
+        let time_in_day = timestamp.rem_euclid(86400) as u32;
 
         let hour = time_in_day / 3600;
         let minute = (time_in_day % 3600) / 60;
@@ -220,7 +221,7 @@ impl DateTime {
         let (year, month, day, day_of_year) = Self::days_to_ymd(days_since_epoch);
 
         // Day of week: 1970-01-01 was Thursday (4)
-        let day_of_week = ((days_since_epoch % 7 + 4) % 7) as u32;
+        let day_of_week = (days_since_epoch + 4).rem_euclid(7) as u32;
 
         Self {
             year,
@@ -262,80 +263,53 @@ impl DateTime {
     }
 
     fn compute_day_of_week(year: i32, month: u32, day: u32) -> u32 {
-        // Zeller's congruence
-        let mut y = year;
-        let mut m = month as i32;
-        if m < 3 {
-            m += 12;
-            y -= 1;
-        }
-        let q = day as i32;
-        let k = y % 100;
-        let j = y / 100;
-        let h = (q + (13 * (m + 1)) / 5 + k + k / 4 + j / 4 - 2 * j) % 7;
-        ((h + 6) % 7) as u32 // Convert to Sunday=0 format
+        (Self::days_before_year(i64::from(year)) - Self::days_before_year(1970)
+            + i64::from(Self::compute_day_of_year(year, month, day))
+            + 4)
+        .rem_euclid(7) as u32
     }
 
-    fn days_to_ymd(mut days: i64) -> (i32, u32, u32, u32) {
-        // Start from 1970
-        let mut year = 1970i32;
+    // Counts proleptic Gregorian days; the additive epoch cancels in differences.
+    fn days_before_year(year: i64) -> i64 {
+        365 * year + (year - 1).div_euclid(4) - (year - 1).div_euclid(100)
+            + (year - 1).div_euclid(400)
+    }
 
-        // Handle negative days (before 1970)
-        while days < 0 {
-            year -= 1;
-            let days_in_year = if Self::is_leap_year(year) { 366 } else { 365 };
-            days += days_in_year;
-        }
-
-        // Handle positive days
-        loop {
-            let days_in_year = if Self::is_leap_year(year) { 366 } else { 365 };
-            if days < days_in_year {
-                break;
+    fn days_to_ymd(days: i64) -> (i32, u32, u32, u32) {
+        let target = days + Self::days_before_year(1970);
+        assert!(
+            target >= Self::days_before_year(i32::MIN as i64)
+                && target < Self::days_before_year(i32::MAX as i64 + 1),
+            "Timestamp exceeds DateTime year range"
+        );
+        let (mut low, mut high) = (i32::MIN as i64, i32::MAX as i64 + 1);
+        while low + 1 < high {
+            let middle = low + (high - low) / 2;
+            if Self::days_before_year(middle) <= target {
+                low = middle;
+            } else {
+                high = middle;
             }
-            days -= days_in_year;
-            year += 1;
         }
-
-        let day_of_year = days as u32;
-
-        // Find month and day
-        let mut month = 1u32;
-        let mut remaining = days as u32;
-        while month <= 12 {
-            let days_in_month = Self::days_in_month(year, month);
-            if remaining < days_in_month {
-                break;
-            }
-            remaining -= days_in_month;
+        let year = low as i32;
+        let day_of_year = (target - Self::days_before_year(low)) as u32;
+        let mut remaining = day_of_year;
+        let mut month = 1;
+        while remaining >= Self::days_in_month(year, month) {
+            remaining -= Self::days_in_month(year, month);
             month += 1;
         }
-
         (year, month, remaining + 1, day_of_year)
     }
 
-    /// Convert to Unix timestamp.
+    /// Converts Gregorian UTC civil time to POSIX seconds, excluding leap seconds.
     pub fn to_timestamp(&self) -> i64 {
-        let mut days = 0i64;
-
-        // Years from 1970
-        for y in 1970..self.year {
-            days += if Self::is_leap_year(y) { 366 } else { 365 };
-        }
-        for y in self.year..1970 {
-            days -= if Self::is_leap_year(y) { 366 } else { 365 };
-        }
-
-        // Days in current year
-        days += self.day_of_year as i64;
-
-        // Time of day
-        let seconds = days * 86400
-            + self.hour as i64 * 3600
-            + self.minute as i64 * 60
-            + self.second as i64;
-
-        seconds
+        let days = Self::days_before_year(i64::from(self.year)) - Self::days_before_year(1970)
+            + i64::from(Self::compute_day_of_year(self.year, self.month, self.day));
+        days * 86400
+            + i64::from(self.hour) * 3600
+            + i64::from(self.minute) * 60
+            + i64::from(self.second)
     }
 }
 
@@ -464,7 +438,11 @@ impl DateEncoder {
         let holiday_encoder = if params.holiday_width > 0 {
             // Validate holiday dates
             for h in &params.holiday_dates {
-                if h.month < 1 || h.month > 12 || h.day < 1 || h.day > 31 {
+                if h.month < 1
+                    || h.month > 12
+                    || h.day < 1
+                    || h.day > DateTime::days_in_month(h.year.unwrap_or(2000), h.month)
+                {
                     return Err(MokoshError::InvalidParameter {
                         name: "holiday_dates",
                         message: format!("Invalid holiday date: {:?}", h),
@@ -583,11 +561,11 @@ impl DateEncoder {
 
     /// Checks if a datetime is a weekend.
     ///
-    /// Weekend is defined as: Friday evening (after 6pm), Saturday, and Sunday.
+    /// Matches htm.core: Friday hours 19-23, Saturday, and Sunday.
     fn is_weekend(dt: &DateTime) -> bool {
         dt.day_of_week == 0 // Sunday
             || dt.day_of_week == 6 // Saturday
-            || (dt.day_of_week == 5 && dt.hour >= 18) // Friday evening
+            || (dt.day_of_week == 5 && dt.hour > 18) // Friday evening
     }
 
     /// Computes the holiday value for a datetime.
@@ -602,26 +580,33 @@ impl DateEncoder {
         let input_ts = dt.to_timestamp();
 
         for h in &self.params.holiday_dates {
-            let holiday_year = h.year.unwrap_or(dt.year);
-            let holiday_dt = DateTime::new(holiday_year, h.month, h.day, 0, 0, 0);
-            let holiday_ts = holiday_dt.to_timestamp();
-
-            if input_ts >= holiday_ts {
-                // Holiday is in the past or now
-                let diff = input_ts - holiday_ts;
-                if diff < SECONDS_PER_DAY {
-                    // On the holiday itself
-                    return 1.0;
-                } else if diff < SECONDS_PER_DAY * 2 {
-                    // Day after holiday, ramp from 1 to 2
-                    return 1.0 + ((diff - SECONDS_PER_DAY) as Real / SECONDS_PER_DAY as Real);
-                }
+            // Recurring holidays may be one day away across a year boundary.
+            let years = if let Some(year) = h.year {
+                vec![year]
             } else {
-                // Holiday is in the future
-                let diff = holiday_ts - input_ts;
-                if diff < SECONDS_PER_DAY {
-                    // Day before holiday, ramp from 0 to 1
-                    return 1.0 - (diff as Real / SECONDS_PER_DAY as Real);
+                [
+                    dt.year.checked_sub(1),
+                    Some(dt.year),
+                    dt.year.checked_add(1),
+                ]
+                .into_iter()
+                .flatten()
+                .collect()
+            };
+            for year in years {
+                if h.day > DateTime::days_in_month(year, h.month) {
+                    continue;
+                }
+                let holiday_ts = DateTime::new(year, h.month, h.day, 0, 0, 0).to_timestamp();
+                let diff = input_ts - holiday_ts;
+                if (0..SECONDS_PER_DAY).contains(&diff) {
+                    return 1.0;
+                }
+                if (SECONDS_PER_DAY..2 * SECONDS_PER_DAY).contains(&diff) {
+                    return 1.0 + (diff - SECONDS_PER_DAY) as Real / SECONDS_PER_DAY as Real;
+                }
+                if (-SECONDS_PER_DAY..0).contains(&diff) {
+                    return 1.0 + diff as Real / SECONDS_PER_DAY as Real;
                 }
             }
         }
@@ -951,5 +936,37 @@ mod tests {
         // Wednesday
         let wed = DateTime::new(2020, 1, 1, 12, 0, 0);
         assert!(!DateEncoder::is_weekend(&wed));
+    }
+
+    #[test]
+    fn recurring_holidays_cross_year_boundaries() {
+        let e = DateEncoder::new(DateEncoderParams {
+            holiday_width: 5,
+            holiday_dates: vec![Holiday::annual(1, 1)],
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(
+            e.compute_holiday_value(&DateTime::new(2024, 12, 31, 12, 0, 0)),
+            0.5
+        );
+        assert_eq!(
+            e.compute_holiday_value(&DateTime::new(2025, 1, 1, 12, 0, 0)),
+            1.0
+        );
+        assert_eq!(
+            e.compute_holiday_value(&DateTime::new(2025, 1, 2, 12, 0, 0)),
+            1.5
+        );
+        let leap = DateEncoder::new(DateEncoderParams {
+            holiday_width: 5,
+            holiday_dates: vec![Holiday::annual(2, 29)],
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(
+            leap.compute_holiday_value(&DateTime::new(2025, 2, 28, 12, 0, 0)),
+            0.0
+        );
     }
 }

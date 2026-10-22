@@ -5,10 +5,9 @@
 //! between cells (segments and synapses) used by both Spatial Pooler and
 //! Temporal Memory.
 
-use crate::error::{MokoshError, Result};
 use crate::types::{
-    CellIdx, ElemSparse, Permanence, Real, Segment, SegmentIdx, Sdr, Synapse, SynapseIdx,
-    MAX_PERMANENCE, MIN_PERMANENCE,
+    CellIdx, ElemSparse, Permanence, Sdr, Segment, SegmentIdx, Synapse, SynapseIdx, MAX_PERMANENCE,
+    MIN_PERMANENCE,
 };
 use crate::utils::Random;
 
@@ -162,6 +161,10 @@ pub struct Connections {
 impl Connections {
     /// Creates a new Connections instance with the given parameters.
     pub fn new(params: ConnectionsParams) -> Self {
+        assert!(
+            params.connected_threshold.is_finite()
+                && (0.0..=1.0).contains(&params.connected_threshold)
+        );
         let num_cells = params.num_cells as usize;
 
         Self {
@@ -170,7 +173,7 @@ impl Connections {
             destroyed_segments: Vec::new(),
             synapses: Vec::new(),
             destroyed_synapses: Vec::new(),
-            connected_threshold: params.connected_threshold,
+            connected_threshold: params.connected_threshold - crate::types::EPSILON,
             iteration: 0,
             potential_synapses_for_presynaptic_cell: AHashMap::new(),
             connected_synapses_for_presynaptic_cell: AHashMap::new(),
@@ -254,6 +257,10 @@ impl Connections {
         cell: CellIdx,
         max_segments_per_cell: Option<SegmentIdx>,
     ) -> Segment {
+        assert!(
+            max_segments_per_cell != Some(0),
+            "Segment capacity must be positive"
+        );
         // Enforce segment limit if specified
         if let Some(max) = max_segments_per_cell {
             while self.cells[cell as usize].segments.len() >= max as usize {
@@ -278,6 +285,7 @@ impl Connections {
 
     /// Destroys a segment and all its synapses.
     pub fn destroy_segment(&mut self, segment: Segment) {
+        assert!(self.segment_exists(segment), "Segment is already destroyed");
         let segment_data = &self.segments[segment as usize];
         let cell = segment_data.cell;
 
@@ -304,11 +312,20 @@ impl Connections {
             return;
         }
 
-        // Find segment with fewest synapses (least useful heuristic)
+        // Reference heuristic: sum of squared synaptic permanences.
         let segment_to_prune = segments
             .iter()
             .copied()
-            .min_by_key(|&s| self.segments[s as usize].synapses.len())
+            .min_by(|&a, &b| {
+                let score = |s: Segment| {
+                    self.segments[s as usize]
+                        .synapses
+                        .iter()
+                        .map(|&syn| self.synapses[syn as usize].permanence.powi(2))
+                        .sum::<Permanence>()
+                };
+                score(a).total_cmp(&score(b)).then(a.cmp(&b))
+            })
             .unwrap();
 
         self.destroy_segment(segment_to_prune);
@@ -318,6 +335,13 @@ impl Connections {
     #[inline]
     pub fn segments_for_cell(&self, cell: CellIdx) -> &[Segment] {
         &self.cells[cell as usize].segments
+    }
+
+    /// Returns whether a flat segment slot currently belongs to a cell.
+    pub fn segment_exists(&self, segment: Segment) -> bool {
+        self.segments
+            .get(segment as usize)
+            .is_some_and(|s| self.cells[s.cell as usize].segments.contains(&segment))
     }
 
     /// Gets the cell that owns a segment.
@@ -374,6 +398,11 @@ impl Connections {
         presynaptic_cell: CellIdx,
         permanence: Permanence,
     ) -> Synapse {
+        assert!(permanence.is_finite(), "Synapse permanence must be finite");
+        assert!(
+            self.segment_exists(segment),
+            "Cannot add synapses to a destroyed segment"
+        );
         // Check for existing synapse to same presynaptic cell
         let existing = self.segments[segment as usize]
             .synapses
@@ -390,6 +419,10 @@ impl Connections {
             return existing_synapse;
         }
 
+        assert!(
+            self.segments[segment as usize].synapses.len() < u16::MAX as usize,
+            "Synapse capacity exceeded"
+        );
         let permanence = permanence.clamp(MIN_PERMANENCE, MAX_PERMANENCE);
 
         let synapse = if let Some(reuse) = self.destroyed_synapses.pop() {
@@ -418,6 +451,10 @@ impl Connections {
 
     /// Destroys a synapse.
     pub fn destroy_synapse(&mut self, synapse: Synapse) {
+        assert!(
+            self.synapses[synapse as usize].permanence >= MIN_PERMANENCE,
+            "Synapse is already destroyed"
+        );
         let synapse_data = &self.synapses[synapse as usize];
         let segment = synapse_data.segment;
         let presynaptic_cell = synapse_data.presynaptic_cell;
@@ -431,8 +468,9 @@ impl Connections {
 
         // Update connected count
         if was_connected {
-            self.segments[segment as usize].num_connected =
-                self.segments[segment as usize].num_connected.saturating_sub(1);
+            self.segments[segment as usize].num_connected = self.segments[segment as usize]
+                .num_connected
+                .saturating_sub(1);
         }
 
         // Remove from presynaptic maps
@@ -446,6 +484,11 @@ impl Connections {
 
     /// Updates a synapse's permanence value.
     pub fn update_synapse_permanence(&mut self, synapse: Synapse, permanence: Permanence) {
+        assert!(permanence.is_finite(), "Synapse permanence must be finite");
+        assert!(
+            self.synapses[synapse as usize].permanence >= MIN_PERMANENCE,
+            "Synapse is already destroyed"
+        );
         let permanence = permanence.clamp(MIN_PERMANENCE, MAX_PERMANENCE);
         let synapse_data = &mut self.synapses[synapse as usize];
         let old_perm = synapse_data.permanence;
@@ -464,8 +507,9 @@ impl Connections {
                 // Move from potential to connected map
                 self.move_synapse_to_connected(synapse, presynaptic_cell, segment);
             } else {
-                self.segments[segment as usize].num_connected =
-                    self.segments[segment as usize].num_connected.saturating_sub(1);
+                self.segments[segment as usize].num_connected = self.segments[segment as usize]
+                    .num_connected
+                    .saturating_sub(1);
                 // Move from connected to potential map
                 self.move_synapse_to_potential(synapse, presynaptic_cell, segment);
             }
@@ -551,12 +595,18 @@ impl Connections {
         let segment = self.synapses[synapse as usize].segment;
 
         // Remove from potential maps
-        if let Some(synapses) = self.potential_synapses_for_presynaptic_cell.get_mut(&presynaptic_cell) {
+        if let Some(synapses) = self
+            .potential_synapses_for_presynaptic_cell
+            .get_mut(&presynaptic_cell)
+        {
             if let Some(pos) = synapses.iter().position(|&s| s == synapse) {
                 synapses.swap_remove(pos);
             }
         }
-        if let Some(segments) = self.potential_segments_for_presynaptic_cell.get_mut(&presynaptic_cell) {
+        if let Some(segments) = self
+            .potential_segments_for_presynaptic_cell
+            .get_mut(&presynaptic_cell)
+        {
             if let Some(pos) = segments.iter().position(|&s| s == segment) {
                 segments.swap_remove(pos);
             }
@@ -564,12 +614,18 @@ impl Connections {
 
         // Remove from connected maps if was connected
         if was_connected {
-            if let Some(synapses) = self.connected_synapses_for_presynaptic_cell.get_mut(&presynaptic_cell) {
+            if let Some(synapses) = self
+                .connected_synapses_for_presynaptic_cell
+                .get_mut(&presynaptic_cell)
+            {
                 if let Some(pos) = synapses.iter().position(|&s| s == synapse) {
                     synapses.swap_remove(pos);
                 }
             }
-            if let Some(segments) = self.connected_segments_for_presynaptic_cell.get_mut(&presynaptic_cell) {
+            if let Some(segments) = self
+                .connected_segments_for_presynaptic_cell
+                .get_mut(&presynaptic_cell)
+            {
                 if let Some(pos) = segments.iter().position(|&s| s == segment) {
                     segments.swap_remove(pos);
                 }
@@ -577,7 +633,12 @@ impl Connections {
         }
     }
 
-    fn move_synapse_to_connected(&mut self, synapse: Synapse, presynaptic_cell: CellIdx, segment: Segment) {
+    fn move_synapse_to_connected(
+        &mut self,
+        synapse: Synapse,
+        presynaptic_cell: CellIdx,
+        segment: Segment,
+    ) {
         self.connected_synapses_for_presynaptic_cell
             .entry(presynaptic_cell)
             .or_default()
@@ -588,13 +649,24 @@ impl Connections {
             .push(segment);
     }
 
-    fn move_synapse_to_potential(&mut self, synapse: Synapse, presynaptic_cell: CellIdx, segment: Segment) {
-        if let Some(synapses) = self.connected_synapses_for_presynaptic_cell.get_mut(&presynaptic_cell) {
+    fn move_synapse_to_potential(
+        &mut self,
+        synapse: Synapse,
+        presynaptic_cell: CellIdx,
+        segment: Segment,
+    ) {
+        if let Some(synapses) = self
+            .connected_synapses_for_presynaptic_cell
+            .get_mut(&presynaptic_cell)
+        {
             if let Some(pos) = synapses.iter().position(|&s| s == synapse) {
                 synapses.swap_remove(pos);
             }
         }
-        if let Some(segments) = self.connected_segments_for_presynaptic_cell.get_mut(&presynaptic_cell) {
+        if let Some(segments) = self
+            .connected_segments_for_presynaptic_cell
+            .get_mut(&presynaptic_cell)
+        {
             if let Some(pos) = segments.iter().position(|&s| s == segment) {
                 segments.swap_remove(pos);
             }
@@ -620,7 +692,9 @@ impl Connections {
         active_presynaptic_cells: &[CellIdx],
         learn: bool,
     ) -> Vec<SynapseIdx> {
-        self.iteration += 1;
+        if learn {
+            self.iteration += 1;
+        }
 
         if self.timeseries && learn {
             std::mem::swap(&mut self.previous_updates, &mut self.current_updates);
@@ -648,7 +722,9 @@ impl Connections {
         active_presynaptic_cells: &[CellIdx],
         learn: bool,
     ) -> (Vec<SynapseIdx>, Vec<SynapseIdx>) {
-        self.iteration += 1;
+        if learn {
+            self.iteration += 1;
+        }
 
         if self.timeseries && learn {
             std::mem::swap(&mut self.previous_updates, &mut self.current_updates);
@@ -706,6 +782,10 @@ impl Connections {
             .copied()
             .collect();
 
+        if self.timeseries {
+            self.previous_updates.resize(self.synapses.len(), 0.0);
+            self.current_updates.resize(self.synapses.len(), 0.0);
+        }
         let mut synapses_to_destroy = Vec::new();
 
         for synapse in synapses {
@@ -720,21 +800,20 @@ impl Connections {
             };
 
             // Handle time-series mode
-            let effective_delta = if self.timeseries
-                && synapse < self.previous_updates.len() as Synapse
-            {
-                let prev = self.previous_updates[synapse as usize];
-                if prev != 0.0 && prev.signum() == delta.signum() {
-                    0.0 // Skip if same direction as previous update
+            let effective_delta =
+                if self.timeseries && synapse < self.previous_updates.len() as Synapse {
+                    let prev = self.previous_updates[synapse as usize];
+                    if prev == delta {
+                        0.0 // Suppress the same requested update on consecutive cycles.
+                    } else {
+                        delta
+                    }
                 } else {
                     delta
-                }
-            } else {
-                delta
-            };
+                };
 
             if self.timeseries && synapse < self.current_updates.len() as Synapse {
-                self.current_updates[synapse as usize] = effective_delta;
+                self.current_updates[synapse as usize] = delta;
             }
 
             let new_perm = (old_perm + effective_delta).clamp(MIN_PERMANENCE, MAX_PERMANENCE);
@@ -744,7 +823,7 @@ impl Connections {
             }
 
             // Mark for destruction if permanence is zero
-            if prune_zero_synapses && new_perm <= MIN_PERMANENCE {
+            if prune_zero_synapses && old_perm + delta < MIN_PERMANENCE + 1e-6 {
                 synapses_to_destroy.push(synapse);
             }
         }
@@ -785,6 +864,8 @@ impl Connections {
             .filter(|c| !existing.contains(c))
             .collect();
 
+        let mut seen = std::collections::HashSet::new();
+        candidates.retain(|c| seen.insert(*c));
         if candidates.is_empty() {
             return;
         }
@@ -804,8 +885,10 @@ impl Connections {
             let current = self.segments[segment as usize].synapses.len();
             if current + candidates.len() > max {
                 let to_destroy = current + candidates.len() - max;
-                self.destroy_min_permanence_synapses(segment, to_destroy, &[]);
+                self.destroy_min_permanence_synapses(segment, to_destroy, growth_candidates);
             }
+            let available = max.saturating_sub(self.num_synapses_on_segment(segment));
+            candidates.truncate(available);
         }
 
         // Create new synapses
@@ -816,32 +899,20 @@ impl Connections {
 
     /// Raises permanences until the segment has at least `threshold` connected synapses.
     pub fn raise_permanences_to_threshold(&mut self, segment: Segment, threshold: u32) {
-        let current_connected = self.segments[segment as usize].num_connected;
-        if current_connected >= threshold as SynapseIdx {
+        let data = &self.segments[segment as usize];
+        let threshold = (threshold as usize).min(data.synapses.len());
+        if threshold == 0 || data.num_connected as usize >= threshold {
             return;
         }
-
-        let needed = threshold as usize - current_connected as usize;
-
-        // Get synapses sorted by permanence (highest first among unconnected)
-        let mut unconnected: Vec<(Synapse, Permanence)> = self.segments[segment as usize]
+        let mut permanences: Vec<_> = data
             .synapses
             .iter()
-            .filter_map(|&s| {
-                let perm = self.synapses[s as usize].permanence;
-                if perm < self.connected_threshold {
-                    Some((s, perm))
-                } else {
-                    None
-                }
-            })
+            .map(|&s| self.synapses[s as usize].permanence)
             .collect();
-
-        unconnected.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
-
-        // Raise permanences of top candidates
-        for (synapse, _) in unconnected.into_iter().take(needed) {
-            self.update_synapse_permanence(synapse, self.connected_threshold);
+        permanences.select_nth_unstable_by(threshold - 1, |a, b| b.total_cmp(a));
+        let increment = self.connected_threshold - permanences[threshold - 1];
+        if increment > 0.0 {
+            self.bump_segment(segment, increment);
         }
     }
 
@@ -902,52 +973,29 @@ impl Connections {
         min_synapses: SynapseIdx,
         max_synapses: SynapseIdx,
     ) {
-        let current = self.segments[segment as usize].num_connected;
-
-        if current < min_synapses {
-            // Need to connect more synapses
-            let needed = min_synapses - current;
-            let mut unconnected: Vec<(Synapse, Permanence)> = self.segments[segment as usize]
-                .synapses
-                .iter()
-                .filter_map(|&s| {
-                    let perm = self.synapses[s as usize].permanence;
-                    if perm < self.connected_threshold {
-                        Some((s, perm))
-                    } else {
-                        None
-                    }
-                })
-                .collect();
-
-            unconnected.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
-
-            for (synapse, _) in unconnected.into_iter().take(needed as usize) {
-                self.update_synapse_permanence(synapse, self.connected_threshold);
-            }
-        } else if current > max_synapses {
-            // Need to disconnect some synapses
-            let to_remove = current - max_synapses;
-            let mut connected: Vec<(Synapse, Permanence)> = self.segments[segment as usize]
-                .synapses
-                .iter()
-                .filter_map(|&s| {
-                    let perm = self.synapses[s as usize].permanence;
-                    if perm >= self.connected_threshold {
-                        Some((s, perm))
-                    } else {
-                        None
-                    }
-                })
-                .collect();
-
-            connected.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
-
-            for (synapse, _) in connected.into_iter().take(to_remove as usize) {
-                let new_perm = self.connected_threshold - 0.001;
-                self.update_synapse_permanence(synapse, new_perm);
-            }
+        assert!(min_synapses <= max_synapses && max_synapses > 0);
+        let data = &self.segments[segment as usize];
+        let desired = if data.num_connected < min_synapses {
+            min_synapses
+        } else if data.num_connected > max_synapses {
+            max_synapses
+        } else {
+            return;
+        };
+        let desired = (desired as usize).min(data.synapses.len());
+        if desired == 0 {
+            return;
         }
+        let mut permanences: Vec<_> = data
+            .synapses
+            .iter()
+            .map(|&s| self.synapses[s as usize].permanence)
+            .collect();
+        permanences.select_nth_unstable_by(desired - 1, |a, b| b.total_cmp(a));
+        self.bump_segment(
+            segment,
+            self.connected_threshold + crate::types::EPSILON - permanences[desired - 1],
+        );
     }
 
     /// Resets time-series state.
