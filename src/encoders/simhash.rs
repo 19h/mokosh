@@ -104,7 +104,7 @@ impl Default for SimHashDocumentEncoderParams {
 /// assert_eq!(sdr.get_sum(), 21);
 /// ```
 #[derive(Debug, Clone)]
-#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[cfg_attr(feature = "serde", derive(Serialize))]
 pub struct SimHashDocumentEncoder {
     size: UInt,
     active_bits: UInt,
@@ -121,6 +121,22 @@ pub struct SimHashDocumentEncoder {
 }
 
 impl SimHashDocumentEncoder {
+    /// Validates persisted output geometry and histogram limits.
+    pub fn validate(&self) -> crate::Result<()> {
+        if self.size == 0
+            || self.active_bits == 0
+            || self.active_bits >= self.size
+            || self.dimensions != [self.size]
+            || self.frequency_ceiling > 0
+                && self.frequency_floor > 0
+                && self.frequency_ceiling <= self.frequency_floor
+            || self.encode_orphans && self.vocabulary.is_empty()
+        {
+            return Err(MokoshError::InvalidSdrData("Invalid SimHash state".into()));
+        }
+        Ok(())
+    }
+
     /// Creates a new SimHash Document Encoder.
     pub fn new(params: SimHashDocumentEncoderParams) -> Result<Self> {
         // Validate size
@@ -731,5 +747,35 @@ mod tests {
 
         // Same input should produce same output
         assert_eq!(sdr1.get_sparse(), sdr2.get_sparse());
+    }
+}
+
+#[cfg(feature = "serde")]
+mod checked_serde {
+    use super::*;
+    #[derive(Deserialize)]
+    #[serde(remote = "SimHashDocumentEncoder")]
+    struct State {
+        size: UInt,
+        active_bits: UInt,
+        case_sensitivity: bool,
+        encode_orphans: bool,
+        excludes: HashSet<String>,
+        frequency_ceiling: UInt,
+        frequency_floor: UInt,
+        token_similarity: bool,
+        vocabulary: HashMap<String, UInt>,
+
+        /// Output dimensions.
+        dimensions: Vec<UInt>,
+    }
+    impl<'de> Deserialize<'de> for SimHashDocumentEncoder {
+        fn deserialize<D: serde::Deserializer<'de>>(
+            deserializer: D,
+        ) -> std::result::Result<Self, D::Error> {
+            let value = State::deserialize(deserializer)?;
+            value.validate().map_err(serde::de::Error::custom)?;
+            Ok(value)
+        }
     }
 }

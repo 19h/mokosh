@@ -121,7 +121,7 @@ impl Default for SpatialPoolerParams {
 /// sp.compute(&input, true, &mut output);
 /// ```
 #[derive(Debug, Clone)]
-#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[cfg_attr(feature = "serde", derive(Serialize))]
 pub struct SpatialPooler {
     // Configuration
     input_dimensions: Vec<UInt>,
@@ -174,6 +174,98 @@ pub struct SpatialPooler {
 }
 
 impl SpatialPooler {
+    /// Validates persisted parameters, synaptic graph and derived state.
+    pub fn validate(&self) -> Result<()> {
+        let invalid = |message: &str| {
+            MokoshError::InvalidSdrData(format!("Invalid spatial pooler: {message}"))
+        };
+        let size = |dims: &[UInt]| {
+            dims.iter().try_fold(1usize, |n, &d| {
+                n.checked_mul(d as usize)
+                    .filter(|&v| d > 0 && v <= u32::MAX as usize)
+            })
+        };
+        if self.input_dimensions.is_empty()
+            || self.input_dimensions.len() != self.column_dimensions.len()
+            || size(&self.input_dimensions) != Some(self.num_inputs)
+            || size(&self.column_dimensions) != Some(self.num_columns)
+        {
+            return Err(invalid("dimensions"));
+        }
+        if !self.potential_pct.is_finite()
+            || !(0.0..=1.0).contains(&self.potential_pct)
+            || self.potential_pct == 0.0
+            || self.duty_cycle_period == 0
+            || self.update_period == 0
+            || self.inhibition_radius == 0
+            || !self.boost_strength.is_finite()
+            || !(0.0..=88.0).contains(&self.boost_strength)
+            || (self.num_active_columns_per_inh_area == 0
+                && (!self.local_area_density.is_finite()
+                    || self.local_area_density <= 0.0
+                    || self.local_area_density > 0.5))
+        {
+            return Err(invalid("parameters"));
+        }
+        for p in [
+            self.syn_perm_connected,
+            self.syn_perm_active_inc,
+            self.syn_perm_inactive_dec,
+            self.syn_perm_below_stimulus_inc,
+            self.min_pct_overlap_duty_cycles,
+            self.init_connected_pct,
+        ] {
+            if !p.is_finite() || !(0.0..=1.0).contains(&p) {
+                return Err(invalid("permanence"));
+            }
+        }
+        for v in [
+            &self.boost_factors,
+            &self.overlap_duty_cycles,
+            &self.active_duty_cycles,
+            &self.min_overlap_duty_cycles,
+            &self.min_active_duty_cycles,
+            &self.boosted_overlaps,
+        ] {
+            if v.len() != self.num_columns || v.iter().any(|n| !n.is_finite() || *n < 0.0) {
+                return Err(invalid("column state"));
+            }
+        }
+        self.connections.validate()?;
+        if self.connections.num_cells() != self.num_columns
+            || self.connections.connected_threshold().to_bits()
+                != (self.syn_perm_connected - crate::types::EPSILON).to_bits()
+        {
+            return Err(invalid("graph configuration"));
+        }
+        for cell in 0..self.num_columns as CellIdx {
+            let segments = self.connections.segments_for_cell(cell);
+            if segments.len() != 1
+                || self
+                    .connections
+                    .presynaptic_cells_for_segment(segments[0])
+                    .iter()
+                    .any(|&i| i as usize >= self.num_inputs)
+            {
+                return Err(invalid("column graph"));
+            }
+        }
+        if !self.global_inhibition
+            && !self.neighbor_map.matches(
+                &self.column_dimensions,
+                self.inhibition_radius,
+                if self.wrap_around {
+                    WrappingMode::Wrap
+                } else {
+                    WrappingMode::NoWrap
+                },
+            )
+        {
+            return Err(invalid("neighborhood cache"));
+        }
+        Ok(())
+    }
+
     /// Creates a new Spatial Pooler with the given parameters.
     pub fn new(params: SpatialPoolerParams) -> Result<Self> {
         // Validate parameters
@@ -245,11 +337,11 @@ impl SpatialPooler {
         }
         if params.duty_cycle_period == 0
             || !params.boost_strength.is_finite()
-            || params.boost_strength < 0.0
+            || !(0.0..=88.0).contains(&params.boost_strength)
         {
             return Err(MokoshError::InvalidParameter {
                 name: "duty_cycle_period/boost_strength",
-                message: "Period must be positive; boost must be finite and nonnegative".into(),
+                message: "Period must be positive; boost must be finite and in [0, 88] for f32 exponentials".into(),
             });
         }
         // Overlap counters use the reference 16-bit SynapseIdx type.
@@ -671,6 +763,17 @@ impl SpatialPooler {
         if self.global_inhibition {
             // Exact exponentials preserve reference column rankings and the
             // neutral factor 1 at target density.
+            #[cfg(feature = "rayon")]
+            if self.num_columns >= 4096 {
+                use rayon::prelude::*;
+                self.boost_factors
+                    .par_iter_mut()
+                    .zip(self.active_duty_cycles.par_iter())
+                    .for_each(|(boost, &duty)| {
+                        *boost = (self.boost_strength * (target_density - duty)).exp();
+                    });
+                return;
+            }
             for (boost, &duty) in self.boost_factors.iter_mut().zip(&self.active_duty_cycles) {
                 *boost = (self.boost_strength * (target_density - duty)).exp();
             }
@@ -1132,5 +1235,71 @@ mod tests {
             ..Default::default()
         });
         assert!(result.is_err());
+    }
+}
+
+#[cfg(feature = "serde")]
+mod checked_serde {
+    use super::*;
+    #[derive(Deserialize)]
+    #[serde(remote = "SpatialPooler")]
+    struct State {
+        // Configuration
+        input_dimensions: Vec<UInt>,
+        column_dimensions: Vec<UInt>,
+        num_inputs: usize,
+        num_columns: usize,
+        potential_radius: UInt,
+        potential_pct: Real,
+        global_inhibition: bool,
+        local_area_density: Real,
+        num_active_columns_per_inh_area: UInt,
+        stimulus_threshold: UInt,
+        inhibition_radius: UInt,
+        duty_cycle_period: UInt,
+        boost_strength: Real,
+        wrap_around: bool,
+        update_period: UInt,
+        sp_verbosity: UInt,
+
+        // Permanence parameters
+        syn_perm_inactive_dec: Permanence,
+        syn_perm_active_inc: Permanence,
+        syn_perm_below_stimulus_inc: Permanence,
+        syn_perm_connected: Permanence,
+        min_pct_overlap_duty_cycles: Real,
+        init_connected_pct: Real,
+
+        // State
+        boost_factors: Vec<Real>,
+        overlap_duty_cycles: Vec<Real>,
+        active_duty_cycles: Vec<Real>,
+        min_overlap_duty_cycles: Vec<Real>,
+        min_active_duty_cycles: Vec<Real>,
+        boosted_overlaps: Vec<Real>,
+
+        // Synaptic connections (one segment per column)
+        connections: Connections,
+
+        // Iteration counters
+        iteration_num: UInt,
+        iteration_learn_num: UInt,
+
+        // Cached neighbor map for local inhibition
+        neighbor_map: Neighborhood,
+
+        // RNG
+        rng: Random,
+
+        version: UInt,
+    }
+    impl<'de> Deserialize<'de> for SpatialPooler {
+        fn deserialize<D: serde::Deserializer<'de>>(
+            deserializer: D,
+        ) -> std::result::Result<Self, D::Error> {
+            let value = State::deserialize(deserializer)?;
+            value.validate().map_err(serde::de::Error::custom)?;
+            Ok(value)
+        }
     }
 }

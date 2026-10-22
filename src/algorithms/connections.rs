@@ -106,7 +106,7 @@ impl Default for ConnectionsParams {
 /// This is the core data structure used by both Spatial Pooler and Temporal Memory
 /// to store and manipulate the synaptic connectivity.
 #[derive(Debug, Clone)]
-#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[cfg_attr(feature = "serde", derive(Serialize))]
 pub struct Connections {
     /// All cells in the connections graph.
     cells: Vec<CellData>,
@@ -159,6 +159,149 @@ pub struct Connections {
 }
 
 impl Connections {
+    /// Checks graph ownership, free lists, connected counts and reverse indexes.
+    /// Deserialization rejects inconsistent checkpoints through this validator.
+    pub fn validate(&self) -> crate::Result<()> {
+        use crate::error::MokoshError;
+        use std::collections::{BTreeMap, HashSet};
+        let invalid =
+            |message: &str| MokoshError::InvalidSdrData(format!("Invalid connections: {message}"));
+        if !self.connected_threshold.is_finite()
+            || !(-crate::types::EPSILON..=1.0).contains(&self.connected_threshold)
+        {
+            return Err(invalid("connected threshold"));
+        }
+        let mut live_segments = vec![false; self.segments.len()];
+        let mut live_synapses = vec![false; self.synapses.len()];
+        let mut potential_synapses: BTreeMap<CellIdx, Vec<Synapse>> = BTreeMap::new();
+        let mut connected_synapses: BTreeMap<CellIdx, Vec<Synapse>> = BTreeMap::new();
+        let mut potential_segments: BTreeMap<CellIdx, Vec<Segment>> = BTreeMap::new();
+        let mut connected_segments: BTreeMap<CellIdx, Vec<Segment>> = BTreeMap::new();
+        for (cell, data) in self.cells.iter().enumerate() {
+            for &segment in &data.segments {
+                let slot = segment as usize;
+                if slot >= self.segments.len()
+                    || live_segments[slot]
+                    || self.segments[slot].cell as usize != cell
+                {
+                    return Err(invalid("segment ownership"));
+                }
+                live_segments[slot] = true;
+                let data = &self.segments[slot];
+                if data.synapses.len() > u16::MAX as usize {
+                    return Err(invalid("segment capacity"));
+                }
+                let mut presynaptic = HashSet::new();
+                let mut connected = 0usize;
+                for &synapse in &data.synapses {
+                    let slot = synapse as usize;
+                    if slot >= self.synapses.len() || live_synapses[slot] {
+                        return Err(invalid("synapse ownership"));
+                    }
+                    live_synapses[slot] = true;
+                    let syn = &self.synapses[slot];
+                    if syn.segment != segment
+                        || !syn.permanence.is_finite()
+                        || !(0.0..=1.0).contains(&syn.permanence)
+                        || !presynaptic.insert(syn.presynaptic_cell)
+                    {
+                        return Err(invalid("synapse data"));
+                    }
+                    potential_synapses
+                        .entry(syn.presynaptic_cell)
+                        .or_default()
+                        .push(synapse);
+                    potential_segments
+                        .entry(syn.presynaptic_cell)
+                        .or_default()
+                        .push(segment);
+                    if syn.permanence >= self.connected_threshold {
+                        connected += 1;
+                        connected_synapses
+                            .entry(syn.presynaptic_cell)
+                            .or_default()
+                            .push(synapse);
+                        connected_segments
+                            .entry(syn.presynaptic_cell)
+                            .or_default()
+                            .push(segment);
+                    }
+                }
+                if connected != data.num_connected as usize {
+                    return Err(invalid("connected count"));
+                }
+            }
+        }
+        let mut free_segments = HashSet::new();
+        for &segment in &self.destroyed_segments {
+            let slot = segment as usize;
+            if slot >= live_segments.len()
+                || live_segments[slot]
+                || !free_segments.insert(segment)
+                || !self.segments[slot].synapses.is_empty()
+            {
+                return Err(invalid("segment free list"));
+            }
+        }
+        if live_segments.iter().filter(|&&live| !live).count() != free_segments.len() {
+            return Err(invalid("orphan segment"));
+        }
+        let mut free_synapses = HashSet::new();
+        for &synapse in &self.destroyed_synapses {
+            let slot = synapse as usize;
+            if slot >= live_synapses.len()
+                || live_synapses[slot]
+                || !free_synapses.insert(synapse)
+                || self.synapses[slot].permanence != -1.0
+            {
+                return Err(invalid("synapse free list"));
+            }
+        }
+        if live_synapses.iter().filter(|&&live| !live).count() != free_synapses.len() {
+            return Err(invalid("orphan synapse"));
+        }
+        let canonical = |map: &AHashMap<CellIdx, Vec<u32>>| -> BTreeMap<CellIdx, Vec<u32>> {
+            map.iter()
+                .filter(|(_, v)| !v.is_empty())
+                .map(|(&k, v)| {
+                    let mut v = v.clone();
+                    v.sort_unstable();
+                    (k, v)
+                })
+                .collect()
+        };
+        for values in potential_synapses.values_mut() {
+            values.sort_unstable();
+        }
+        for values in connected_synapses.values_mut() {
+            values.sort_unstable();
+        }
+        for values in potential_segments.values_mut() {
+            values.sort_unstable();
+        }
+        for values in connected_segments.values_mut() {
+            values.sort_unstable();
+        }
+        if canonical(&self.potential_synapses_for_presynaptic_cell) != potential_synapses
+            || canonical(&self.connected_synapses_for_presynaptic_cell) != connected_synapses
+            || canonical(&self.potential_segments_for_presynaptic_cell) != potential_segments
+            || canonical(&self.connected_segments_for_presynaptic_cell) != connected_segments
+        {
+            return Err(invalid("reverse indexes"));
+        }
+        if self.previous_updates.len() > self.synapses.len()
+            || self.current_updates.len() > self.synapses.len()
+            || self
+                .previous_updates
+                .iter()
+                .chain(&self.current_updates)
+                .any(|x| !x.is_finite())
+        {
+            return Err(invalid("learning update state"));
+        }
+        Ok(())
+    }
+
     /// Creates a new Connections instance with the given parameters.
     pub fn new(params: ConnectionsParams) -> Self {
         assert!(
@@ -851,48 +994,27 @@ impl Connections {
         max_new: Option<usize>,
         max_synapses_per_segment: Option<usize>,
     ) {
-        // Find candidates not already connected
-        let existing: std::collections::HashSet<_> = self.segments[segment as usize]
-            .synapses
-            .iter()
-            .map(|&s| self.synapses[s as usize].presynaptic_cell)
-            .collect();
-
-        let mut candidates: Vec<CellIdx> = growth_candidates
-            .iter()
-            .copied()
-            .filter(|c| !existing.contains(c))
-            .collect();
-
+        let mut candidates = growth_candidates.to_vec();
         let mut seen = std::collections::HashSet::new();
         candidates.retain(|c| seen.insert(*c));
-        if candidates.is_empty() {
+        let mut num_new = max_new.map_or(candidates.len(), |n| n.min(candidates.len()));
+        if let Some(max) = max_synapses_per_segment {
+            let current = self.num_synapses_on_segment(segment);
+            let excess = current.saturating_add(num_new).saturating_sub(max);
+            self.destroy_min_permanence_synapses(segment, excess, &candidates);
+            num_new = num_new.min(max.saturating_sub(self.num_synapses_on_segment(segment)));
+        }
+        if num_new == 0 {
             return;
         }
-
-        // Limit number of new synapses
-        let num_new = max_new
-            .map(|m| m.min(candidates.len()))
-            .unwrap_or(candidates.len());
-
-        // Subsample if needed
-        if num_new < candidates.len() {
-            candidates = rng.sample(candidates, num_new);
+        if max_new.is_some_and(|n| n > 0 && n < candidates.len()) {
+            rng.shuffle(&mut candidates);
         }
-
-        // Make room if max synapses per segment is specified
-        if let Some(max) = max_synapses_per_segment {
-            let current = self.segments[segment as usize].synapses.len();
-            if current + candidates.len() > max {
-                let to_destroy = current + candidates.len() - max;
-                self.destroy_min_permanence_synapses(segment, to_destroy, growth_candidates);
-            }
-            let available = max.saturating_sub(self.num_synapses_on_segment(segment));
-            candidates.truncate(available);
-        }
-
-        // Create new synapses
+        let desired = self.num_synapses_on_segment(segment) + num_new;
         for candidate in candidates {
+            if self.num_synapses_on_segment(segment) == desired {
+                break;
+            }
             self.create_synapse(segment, candidate, initial_permanence);
         }
     }
@@ -958,7 +1080,7 @@ impl Connections {
             })
             .collect();
 
-        candidates.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
+        candidates.sort_by(|a, b| a.1.total_cmp(&b.1).then(a.0.cmp(&b.0)));
 
         // Destroy lowest permanence synapses
         for (synapse, _) in candidates.into_iter().take(n_destroy) {
@@ -1009,11 +1131,7 @@ impl Connections {
         let cell_a = self.segments[a as usize].cell;
         let cell_b = self.segments[b as usize].cell;
 
-        cell_a.cmp(&cell_b).then_with(|| {
-            let idx_a = self.idx_on_cell_for_segment(a);
-            let idx_b = self.idx_on_cell_for_segment(b);
-            idx_a.cmp(&idx_b)
-        })
+        cell_a.cmp(&cell_b).then(a.cmp(&b))
     }
 }
 
@@ -1250,5 +1368,71 @@ mod tests {
         assert_eq!(syn1, syn2); // Should return same synapse
         assert_eq!(conn.num_synapses_on_segment(seg), 1);
         assert!((conn.data_for_synapse(syn1).permanence - 0.5).abs() < 1e-6); // Keep higher permanence
+    }
+}
+
+#[cfg(feature = "serde")]
+mod checked_serde {
+    use super::*;
+    #[derive(Deserialize)]
+    #[serde(remote = "Connections")]
+    struct State {
+        /// All cells in the connections graph.
+        cells: Vec<CellData>,
+
+        /// All segments (indexed by Segment).
+        segments: Vec<SegmentData>,
+
+        /// Destroyed segment indices (available for reuse).
+        destroyed_segments: Vec<Segment>,
+
+        /// All synapses (indexed by Synapse).
+        synapses: Vec<SynapseData>,
+
+        /// Destroyed synapse indices (available for reuse).
+        destroyed_synapses: Vec<Synapse>,
+
+        /// Permanence threshold for connected synapses.
+        connected_threshold: Permanence,
+
+        /// Iteration counter (incremented in compute_activity).
+        iteration: u32,
+
+        // Presynaptic lookup maps for efficient activity computation
+        /// Maps presynaptic cell -> potential synapses (all synapses from that cell).
+        potential_synapses_for_presynaptic_cell: AHashMap<CellIdx, Vec<Synapse>>,
+
+        /// Maps presynaptic cell -> connected synapses.
+        connected_synapses_for_presynaptic_cell: AHashMap<CellIdx, Vec<Synapse>>,
+
+        /// Maps presynaptic cell -> potential segments.
+        potential_segments_for_presynaptic_cell: AHashMap<CellIdx, Vec<Segment>>,
+
+        /// Maps presynaptic cell -> connected segments.
+        connected_segments_for_presynaptic_cell: AHashMap<CellIdx, Vec<Segment>>,
+
+        /// Time-series mode for correlated data.
+        timeseries: bool,
+
+        /// Previous permanence updates (for time-series mode).
+        previous_updates: Vec<Permanence>,
+
+        /// Current permanence updates (for time-series mode).
+        current_updates: Vec<Permanence>,
+
+        /// Statistics: number of pruned synapses.
+        pruned_synapses: usize,
+
+        /// Statistics: number of pruned segments.
+        pruned_segments: usize,
+    }
+    impl<'de> Deserialize<'de> for Connections {
+        fn deserialize<D: serde::Deserializer<'de>>(
+            deserializer: D,
+        ) -> std::result::Result<Self, D::Error> {
+            let value = State::deserialize(deserializer)?;
+            value.validate().map_err(serde::de::Error::custom)?;
+            Ok(value)
+        }
     }
 }

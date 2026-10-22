@@ -87,6 +87,10 @@ mod serde_impl {
         algorithm: u32,
         seed: u64,
         steps: u64,
+        #[serde(default)]
+        words: Vec<u32>,
+        #[serde(default)]
+        index: usize,
     }
 
     impl Serialize for Random {
@@ -95,9 +99,11 @@ mod serde_impl {
             S: Serializer,
         {
             let state = RandomState {
-                algorithm: 0x4d543031,
+                algorithm: 0x4d543032,
                 seed: self.seed,
                 steps: self.steps,
+                words: self.rng.state.to_vec(),
+                index: self.rng.index,
             };
             state.serialize(serializer)
         }
@@ -109,16 +115,36 @@ mod serde_impl {
             D: Deserializer<'de>,
         {
             let state = RandomState::deserialize(deserializer)?;
-            if state.algorithm != 0x4d543031 {
+            let rng = if state.algorithm == 0x4d543032 {
+                let words: [u32; 624] = state
+                    .words
+                    .try_into()
+                    .map_err(|_| serde::de::Error::custom("Invalid MT19937 state length"))?;
+                let expected_index = if state.steps == 0 {
+                    624
+                } else {
+                    ((state.steps - 1) % 624 + 1) as usize
+                };
+                if state.index != expected_index {
+                    return Err(serde::de::Error::custom("Invalid MT19937 state index"));
+                }
+                Mt19937 {
+                    state: words,
+                    index: state.index,
+                }
+            } else if state.algorithm == 0x4d543031 && state.steps <= 1_000_000 {
+                // Bounded import of the prior JSON checkpoint shape. New saves
+                // include the engine state and restore in constant time.
+                let mut rng = Mt19937::new(state.seed as u32);
+                for _ in 0..state.steps {
+                    rng.next();
+                }
+                rng
+            } else {
                 return Err(serde::de::Error::custom(
-                    "Unsupported RNG checkpoint algorithm",
+                    "Unsupported or unbounded legacy RNG checkpoint",
                 ));
-            }
-            let mut rng = Mt19937::new(state.seed as u32);
-            // Advance the RNG to match the serialized state
-            for _ in 0..state.steps {
-                rng.next();
-            }
+            };
             Ok(Random {
                 rng,
                 seed: state.seed,

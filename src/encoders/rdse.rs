@@ -93,7 +93,7 @@ impl Default for RdseParams {
 /// assert!(sdr.get_sum() > 0 && sdr.get_sum() <= 50);
 /// ```
 #[derive(Debug, Clone)]
-#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[cfg_attr(feature = "serde", derive(Serialize))]
 pub struct RandomDistributedScalarEncoder {
     size: UInt,
     active_bits: UInt,
@@ -111,6 +111,26 @@ pub struct RandomDistributedScalarEncoder {
 pub type Rdse = RandomDistributedScalarEncoder;
 
 impl RandomDistributedScalarEncoder {
+    /// Validates persisted RDSE dimensions and numeric parameters.
+    pub fn validate(&self) -> crate::Result<()> {
+        if self.size == 0
+            || self.active_bits == 0
+            || self.active_bits > self.size
+            || self.dimensions != [self.size]
+            || !self.resolution.is_finite()
+            || self.resolution <= 0.0
+            || !self.radius.is_finite()
+            || self.radius <= 0.0
+            || !self.sparsity.is_finite()
+            || self.sparsity <= 0.0
+            || self.sparsity > 1.0
+            || self.seed == 0
+        {
+            return Err(MokoshError::InvalidSdrData("Invalid RDSE state".into()));
+        }
+        Ok(())
+    }
+
     /// Creates a new RDSE.
     pub fn new(params: RdseParams) -> Result<Self> {
         // Validate size
@@ -222,6 +242,7 @@ impl RandomDistributedScalarEncoder {
             dimensions: vec![params.size],
         };
 
+        encoder.validate()?;
         // Check parameters for hash collision resistance
         if !encoder.check_parameters() {
             return Err(MokoshError::InvalidParameter {
@@ -321,16 +342,9 @@ impl RandomDistributedScalarEncoder {
     }
 }
 
-impl Encoder<Real> for RandomDistributedScalarEncoder {
-    fn dimensions(&self) -> &[UInt] {
-        &self.dimensions
-    }
-
-    fn size(&self) -> usize {
-        self.size as usize
-    }
-
-    fn encode(&self, value: Real, output: &mut Sdr) -> Result<()> {
+impl RandomDistributedScalarEncoder {
+    /// Encodes a double-precision scalar without narrowing the input to f32.
+    pub fn encode_f64(&self, value: f64, output: &mut Sdr) -> Result<()> {
         if output.dimensions() != self.dimensions.as_slice() {
             return Err(MokoshError::DimensionMismatch {
                 expected: self.dimensions.clone(),
@@ -345,7 +359,7 @@ impl Encoder<Real> for RandomDistributedScalarEncoder {
         }
 
         // Validate category input
-        if self.category && value != (value as u64) as Real {
+        if self.category && value != (value as u64) as f64 {
             return Err(MokoshError::InvalidParameter {
                 name: "value",
                 message: "Input to category encoder must be an unsigned integer".to_string(),
@@ -360,7 +374,7 @@ impl Encoder<Real> for RandomDistributedScalarEncoder {
         }
         // Define wrapping explicitly. Rust's float-to-u32 cast saturates negative
         // values, which otherwise collapses the entire negative domain to zero.
-        let index = (f64::from(value) / f64::from(self.resolution))
+        let index = (value / f64::from(self.resolution))
             .trunc()
             .rem_euclid(4294967296.0) as u32;
 
@@ -381,6 +395,26 @@ impl Encoder<Real> for RandomDistributedScalarEncoder {
         output.set_sparse_unchecked(sparse);
 
         Ok(())
+    }
+    /// Allocates and encodes a double-precision scalar.
+    pub fn encode_f64_to_sdr(&self, value: f64) -> Result<Sdr> {
+        let mut output = Sdr::new(&self.dimensions);
+        self.encode_f64(value, &mut output)?;
+        Ok(output)
+    }
+}
+
+impl Encoder<Real> for RandomDistributedScalarEncoder {
+    fn dimensions(&self) -> &[UInt] {
+        &self.dimensions
+    }
+
+    fn size(&self) -> usize {
+        self.size as usize
+    }
+
+    fn encode(&self, value: Real, output: &mut Sdr) -> Result<()> {
+        self.encode_f64(f64::from(value), output)
     }
 }
 
@@ -589,5 +623,33 @@ mod tests {
 
         assert!((encoder.radius() - 10.0).abs() < 0.001);
         assert!((encoder.resolution() - 0.2).abs() < 0.001); // 10.0 / 50
+    }
+}
+
+#[cfg(feature = "serde")]
+mod checked_serde {
+    use super::*;
+    #[derive(Deserialize)]
+    #[serde(remote = "RandomDistributedScalarEncoder")]
+    struct State {
+        size: UInt,
+        active_bits: UInt,
+        sparsity: Real,
+        radius: Real,
+        resolution: Real,
+        category: bool,
+        seed: u32,
+
+        /// Output dimensions.
+        dimensions: Vec<UInt>,
+    }
+    impl<'de> Deserialize<'de> for RandomDistributedScalarEncoder {
+        fn deserialize<D: serde::Deserializer<'de>>(
+            deserializer: D,
+        ) -> std::result::Result<Self, D::Error> {
+            let value = State::deserialize(deserializer)?;
+            value.validate().map_err(serde::de::Error::custom)?;
+            Ok(value)
+        }
     }
 }

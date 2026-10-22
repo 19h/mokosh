@@ -83,7 +83,7 @@ impl Default for ScalarEncoderParams {
 /// assert_eq!(sdr.get_sum(), 10);
 /// ```
 #[derive(Debug, Clone)]
-#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[cfg_attr(feature = "serde", derive(Serialize))]
 pub struct ScalarEncoder {
     minimum: Real,
     maximum: Real,
@@ -110,6 +110,32 @@ pub struct ScalarEncoder {
 }
 
 impl ScalarEncoder {
+    /// Validates cached encoding geometry after deserialization.
+    pub fn validate(&self) -> crate::Result<()> {
+        if !self.minimum.is_finite()
+            || !self.maximum.is_finite()
+            || self.maximum <= self.minimum
+            || !self.resolution.is_finite()
+            || self.resolution <= 0.0
+            || self.size == 0
+            || self.active_bits == 0
+            || self.active_bits > self.size
+            || self.dimensions != [self.size]
+            || self.range != self.maximum - self.minimum
+            || self.num_buckets
+                != if self.periodic {
+                    self.size
+                } else {
+                    self.size - self.active_bits + 1
+                }
+        {
+            return Err(MokoshError::InvalidSdrData(
+                "Invalid scalar encoder state".into(),
+            ));
+        }
+        Ok(())
+    }
+
     /// Creates a new Scalar Encoder.
     pub fn new(params: ScalarEncoderParams) -> Result<Self> {
         if !params.minimum.is_finite()
@@ -229,7 +255,7 @@ impl ScalarEncoder {
             size - params.active_bits + 1
         };
 
-        Ok(Self {
+        let encoder = Self {
             minimum: params.minimum,
             maximum: params.maximum,
             size,
@@ -242,7 +268,9 @@ impl ScalarEncoder {
             half_width,
             num_buckets,
             dimensions: vec![size],
-        })
+        };
+        encoder.validate()?;
+        Ok(encoder)
     }
 
     /// Creates a Scalar Encoder from resolution and other parameters.
@@ -530,5 +558,45 @@ mod tests {
             ..Default::default()
         });
         assert!(result.is_err());
+    }
+}
+
+#[cfg(feature = "serde")]
+mod checked_serde {
+    use super::*;
+    #[derive(Deserialize)]
+    #[serde(remote = "ScalarEncoder")]
+    struct State {
+        minimum: Real,
+        maximum: Real,
+        size: UInt,
+        active_bits: UInt,
+        clip_input: bool,
+        periodic: bool,
+        category: bool,
+
+        /// Precomputed: range of input values.
+        range: Real,
+
+        /// Precomputed: resolution (input units per bit).
+        resolution: Real,
+
+        /// Precomputed: half width of the active region.
+        half_width: UInt,
+
+        /// Precomputed: number of positions for center bit.
+        num_buckets: UInt,
+
+        /// Output dimensions.
+        dimensions: Vec<UInt>,
+    }
+    impl<'de> Deserialize<'de> for ScalarEncoder {
+        fn deserialize<D: serde::Deserializer<'de>>(
+            deserializer: D,
+        ) -> std::result::Result<Self, D::Error> {
+            let value = State::deserialize(deserializer)?;
+            value.validate().map_err(serde::de::Error::custom)?;
+            Ok(value)
+        }
     }
 }

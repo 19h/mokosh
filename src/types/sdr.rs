@@ -27,6 +27,24 @@ pub type SdrCoordinate = Vec<Vec<UInt>>;
 /// Callback function type for SDR value changes.
 pub type SdrCallback = Box<dyn Fn() + Send + Sync>;
 
+type DataCallback = std::sync::Arc<dyn Fn(&Sdr) + Send + Sync>;
+type DataCallbacks = std::sync::Arc<std::sync::Mutex<Vec<Option<DataCallback>>>>;
+
+/// A value-observer registration which disconnects automatically on drop.
+pub struct SdrSubscription {
+    callbacks: std::sync::Weak<std::sync::Mutex<Vec<Option<DataCallback>>>>,
+    index: usize,
+}
+impl Drop for SdrSubscription {
+    fn drop(&mut self) {
+        if let Some(registry) = self.callbacks.upgrade() {
+            if let Ok(mut callbacks) = registry.lock() {
+                callbacks[self.index] = None;
+            }
+        }
+    }
+}
+
 /// Internal cache state for lazy evaluation.
 #[derive(Default)]
 struct SdrCache {
@@ -71,6 +89,9 @@ pub struct Sdr {
 
     /// Callbacks to notify on value changes.
     callbacks: RefCell<Vec<Option<SdrCallback>>>,
+
+    // Lazily allocated value-aware callback registry.
+    data_callbacks: RefCell<Option<DataCallbacks>>,
 
     /// Callbacks to notify on destruction.
     destroy_callbacks: RefCell<Vec<Option<SdrCallback>>>,
@@ -146,6 +167,7 @@ impl Sdr {
             cache: RefCell::new(SdrCache::default()),
             callbacks: RefCell::new(Vec::new()),
             destroy_callbacks: RefCell::new(Vec::new()),
+            data_callbacks: RefCell::new(None),
         }
     }
 
@@ -231,6 +253,41 @@ impl Sdr {
         let callbacks = self.callbacks.borrow();
         for callback in callbacks.iter().flatten() {
             callback();
+        }
+        let registry = self.data_callbacks.borrow().clone();
+        if let Some(registry) = registry {
+            let callbacks: Vec<_> = registry
+                .lock()
+                .expect("SDR callback registry poisoned")
+                .iter()
+                .flatten()
+                .cloned()
+                .collect();
+            for callback in callbacks {
+                callback(self);
+            }
+        }
+    }
+
+    /// Observes value changes without retaining a reference to this SDR.
+    /// Dropping the returned handle disconnects the observer.
+    pub fn subscribe(&self, callback: impl Fn(&Sdr) + Send + Sync + 'static) -> SdrSubscription {
+        let mut slot = self.data_callbacks.borrow_mut();
+        let registry =
+            slot.get_or_insert_with(|| std::sync::Arc::new(std::sync::Mutex::new(Vec::new())));
+        let mut callbacks = registry.lock().expect("SDR callback registry poisoned");
+        let index = callbacks
+            .iter()
+            .position(Option::is_none)
+            .unwrap_or(callbacks.len());
+        if index == callbacks.len() {
+            callbacks.push(Some(std::sync::Arc::new(callback)));
+        } else {
+            callbacks[index] = Some(std::sync::Arc::new(callback));
+        }
+        SdrSubscription {
+            callbacks: std::sync::Arc::downgrade(registry),
+            index,
         }
     }
 

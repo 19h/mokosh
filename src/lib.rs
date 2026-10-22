@@ -71,13 +71,15 @@ pub mod prelude {
     };
     pub use crate::encoders::{
         DateEncoder, DateEncoderParams, Encoder, RandomDistributedScalarEncoder, RdseParams,
-        ScalarEncoder, ScalarEncoderParams,
+        ScalarEncoder, ScalarEncoder64, ScalarEncoderParams, ScalarEncoderParams64,
     };
     pub use crate::types::{
         CellIdx, Int, Int32, Int64, Permanence, Real, Real32, Real64, Sdr, SdrCoordinate, SdrDense,
         SdrSparse, Segment, SegmentIdx, Synapse, SynapseIdx, UInt, UInt16, UInt32, UInt64,
     };
-    pub use crate::utils::{Random, Topology, WrappingMode};
+    pub use crate::utils::{
+        ActivationFrequency, Metrics, Overlap, Random, Sparsity, Topology, WrappingMode,
+    };
 
     #[cfg(feature = "serde")]
     pub use crate::serialization::{Serializable, SerializableFormat};

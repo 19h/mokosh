@@ -57,7 +57,7 @@ impl Default for SdrClassifierParams {
 /// let predictions = classifier.infer(&pattern);
 /// ```
 #[derive(Debug, Clone)]
-#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[cfg_attr(feature = "serde", derive(Serialize))]
 pub struct SdrClassifier {
     /// Learning rate.
     alpha: Real,
@@ -83,6 +83,52 @@ pub struct SdrClassifier {
 }
 
 impl SdrClassifier {
+    /// Validates persisted horizons, history and sparse weight indexes.
+    pub fn validate(&self) -> crate::Result<()> {
+        let invalid = || crate::MokoshError::InvalidSdrData("Invalid classifier state".into());
+        if !self.alpha.is_finite()
+            || self.alpha <= 0.0
+            || self.steps.is_empty()
+            || self.steps.windows(2).any(|w| w[0] >= w[1])
+            || self.input_size == Some(0)
+        {
+            return Err(invalid());
+        }
+        let mut previous = None;
+        for (record, pattern) in &self.pattern_history {
+            if previous.is_some_and(|last| last >= *record)
+                || pattern.windows(2).any(|w| w[0] >= w[1])
+                || pattern
+                    .iter()
+                    .any(|&i| self.input_size.is_none_or(|n| i as usize >= n))
+            {
+                return Err(invalid());
+            }
+            previous = Some(*record);
+        }
+        for (&step, rows) in &self.weights {
+            if self.steps.binary_search(&step).is_err() {
+                return Err(invalid());
+            }
+            let count = self.num_buckets.get(&step).copied().unwrap_or(0);
+            for (&bit, weights) in rows {
+                if self.input_size.is_none_or(|n| bit as usize >= n)
+                    || weights
+                        .iter()
+                        .any(|(&category, &value)| category as usize >= count || !value.is_finite())
+                {
+                    return Err(invalid());
+                }
+            }
+        }
+        if self.num_buckets.iter().any(|(&step, &count)| {
+            self.steps.binary_search(&step).is_err() || count > self.max_bucket as usize + 1
+        }) {
+            return Err(invalid());
+        }
+        Ok(())
+    }
+
     /// Creates a new SDR Classifier.
     pub fn new(params: SdrClassifierParams) -> Self {
         assert!(
@@ -397,5 +443,44 @@ mod tests {
             .max_by(|a, b| a.1.total_cmp(b.1).then(b.0.cmp(&a.0)))
             .map(|(idx, _)| idx);
         assert_eq!(max_idx, Some(0));
+    }
+}
+
+#[cfg(feature = "serde")]
+mod checked_serde {
+    use super::*;
+    #[derive(Deserialize)]
+    #[serde(remote = "SdrClassifier")]
+    struct State {
+        /// Learning rate.
+        alpha: Real,
+
+        /// Prediction steps.
+        steps: Vec<UInt>,
+
+        /// Weight matrix: step -> (input_bit -> (bucket -> weight)).
+        weights: HashMap<UInt, HashMap<u32, HashMap<u32, Real>>>,
+
+        /// History of active patterns for multi-step prediction.
+        pattern_history: VecDeque<(u64, Vec<u32>)>,
+
+        /// Category counts can differ until each prediction horizon is trained.
+        num_buckets: HashMap<UInt, usize>,
+        input_size: Option<usize>,
+
+        /// Maximum bucket index seen.
+        max_bucket: u32,
+
+        /// Iteration count.
+        iteration: usize,
+    }
+    impl<'de> Deserialize<'de> for SdrClassifier {
+        fn deserialize<D: serde::Deserializer<'de>>(
+            deserializer: D,
+        ) -> std::result::Result<Self, D::Error> {
+            let value = State::deserialize(deserializer)?;
+            value.validate().map_err(serde::de::Error::custom)?;
+            Ok(value)
+        }
     }
 }

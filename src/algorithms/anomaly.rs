@@ -107,7 +107,7 @@ impl Anomaly {
 /// The anomaly likelihood is a measure of how unusual the current
 /// anomaly score is compared to recent history.
 #[derive(Debug, Clone)]
-#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[cfg_attr(feature = "serde", derive(Serialize))]
 pub struct AnomalyLikelihood {
     /// Window size for computing statistics.
     learning_period: usize,
@@ -146,6 +146,49 @@ pub struct AnomalyLikelihood {
 }
 
 impl AnomalyLikelihood {
+    /// Validates the persisted rolling distribution and sample windows.
+    pub fn validate(&self) -> crate::Result<()> {
+        let invalid =
+            || crate::MokoshError::InvalidSdrData("Invalid anomaly likelihood state".into());
+        if self.estimation_samples == 0
+            || self.history_limit < self.estimation_samples
+            || self.reestimation_period == 0
+            || self.aggregation_window == 0
+            || self
+                .learning_period
+                .checked_add(self.estimation_samples)
+                .is_none()
+            || self.historical_scores.len() > self.history_limit
+            || self.recent_scores.len() > self.aggregation_window
+            || self.last_reestimation > self.iteration
+            || self
+                .historical_scores
+                .iter()
+                .chain(&self.recent_scores)
+                .any(|v| !v.is_finite() || !(0.0..=1.0).contains(v))
+            || !self.mean.is_finite()
+            || !self.variance.is_finite()
+            || self.variance <= 0.0
+            || !self.previous_tail.is_finite()
+            || !(0.0..=1.0).contains(&self.previous_tail)
+        {
+            return Err(invalid());
+        }
+        let sum = self
+            .recent_scores
+            .iter()
+            .map(|&v| f64::from(v))
+            .sum::<f64>();
+        if !self.recent_sum.is_finite()
+            || (sum - self.recent_sum).abs() > 1e-8 * (1.0 + sum)
+            || !self.running_sum.is_finite()
+            || !self.running_sum_sq.is_finite()
+        {
+            return Err(invalid());
+        }
+        Ok(())
+    }
+
     /// Creates a new AnomalyLikelihood calculator.
     ///
     /// # Arguments
@@ -405,5 +448,57 @@ mod tests {
 
         // 2 out of 3 columns predicted
         assert!((score - 0.33).abs() < 0.1);
+    }
+}
+
+#[cfg(feature = "serde")]
+mod checked_serde {
+    use super::*;
+    #[derive(Deserialize)]
+    #[serde(remote = "AnomalyLikelihood")]
+    struct State {
+        /// Window size for computing statistics.
+        learning_period: usize,
+
+        /// Estimation samples.
+        estimation_samples: usize,
+
+        /// Reestimation period.
+        reestimation_period: usize,
+
+        /// Historical anomaly scores.
+        historical_scores: VecDeque<Real>,
+        history_limit: usize,
+        aggregation_window: usize,
+        recent_scores: VecDeque<Real>,
+        recent_sum: f64,
+        previous_tail: f64,
+
+        /// Running sum for mean calculation.
+        running_sum: f64,
+
+        /// Running sum of squares for variance.
+        running_sum_sq: f64,
+
+        /// Current mean of anomaly scores.
+        mean: f64,
+
+        /// Current variance of anomaly scores.
+        variance: f64,
+
+        /// Iteration counter.
+        iteration: usize,
+
+        /// Last reestimation iteration.
+        last_reestimation: usize,
+    }
+    impl<'de> Deserialize<'de> for AnomalyLikelihood {
+        fn deserialize<D: serde::Deserializer<'de>>(
+            deserializer: D,
+        ) -> std::result::Result<Self, D::Error> {
+            let value = State::deserialize(deserializer)?;
+            value.validate().map_err(serde::de::Error::custom)?;
+            Ok(value)
+        }
     }
 }

@@ -11,11 +11,12 @@
 //!
 //! # Example
 //!
-//! ```rust,ignore
-//! use mokosh::algorithms::SpatialPooler;
+//! ```rust,no_run
+//! # fn main() -> Result<(), Box<dyn std::error::Error>> {
+//! use mokosh::algorithms::{SpatialPooler, SpatialPoolerParams};
 //! use mokosh::serialization::{Serializable, SerializableFormat};
 //!
-//! let sp = SpatialPooler::new(/* ... */);
+//! let sp = SpatialPooler::new(SpatialPoolerParams::default())?;
 //!
 //! // Save to binary file
 //! sp.save_to_file("model.bin", SerializableFormat::Binary)?;
@@ -28,6 +29,8 @@
 //!
 //! // Serialize to JSON string
 //! let json = sp.to_json()?;
+//! # Ok(())
+//! # }
 //! ```
 
 use crate::error::{MokoshError, Result};
@@ -106,9 +109,15 @@ pub trait Serializable: Serialize + DeserializeOwned + Sized {
     fn from_bytes(bytes: &[u8], format: SerializableFormat) -> Result<Self> {
         match format {
             SerializableFormat::Binary => {
-                bincode::deserialize(bytes).map_err(|e| MokoshError::SerializationError {
-                    message: format!("Binary deserialization failed: {}", e),
-                })
+                use bincode::Options;
+                bincode::DefaultOptions::new()
+                    .with_fixint_encoding()
+                    .with_limit(bytes.len() as u64)
+                    .reject_trailing_bytes()
+                    .deserialize(bytes)
+                    .map_err(|e| MokoshError::SerializationError {
+                        message: format!("Binary deserialization failed: {}", e),
+                    })
             }
             SerializableFormat::Json => {
                 serde_json::from_slice(bytes).map_err(|e| MokoshError::SerializationError {

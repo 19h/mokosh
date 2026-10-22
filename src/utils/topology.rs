@@ -266,6 +266,17 @@ pub struct Neighborhood {
 }
 
 impl Neighborhood {
+    pub(crate) fn matches(&self, dimensions: &[UInt], radius: UInt, wrap: WrappingMode) -> bool {
+        let size = Topology::num_elements(dimensions);
+        if self.neighbors.len() != size {
+            return false;
+        }
+        self.neighbors.iter().all(|(&cell, neighbors)| {
+            cell < size
+                && *neighbors == Topology::neighborhood(cell, dimensions, radius, wrap, false)
+        })
+    }
+
     /// Creates a new neighborhood cache.
     pub fn new() -> Self {
         Self {

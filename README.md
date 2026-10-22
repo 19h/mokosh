@@ -17,7 +17,7 @@ See [the port review](PORT_REVIEW.md) for verified behavior, reference fixtures,
 - **Spatial Pooler** - Creates sparse, distributed representations of input patterns
 - **Temporal Memory** - Learns sequences and makes predictions
 - **Anomaly Detection** - Identifies unusual patterns in data streams
-- **38 Encoders** - Convert raw data into SDR format (scalar, categorical, temporal, audio, vision, network, biometric, financial, probabilistic) - see [ENCODERS.md](ENCODERS.md)
+- **39 Encoders** - Convert raw data into SDR format (scalar, categorical, temporal, audio, vision, network, biometric, financial, probabilistic) - see [ENCODERS.md](ENCODERS.md)
 - **SIMD Optimizations** - AVX2-accelerated operations for boost factors, duty cycles, and permanence updates
 - **Serialization** - Save and load models in binary or JSON format
 - **Zero unsafe code in core algorithms** - Safe Rust implementation
@@ -36,7 +36,7 @@ mokosh = "0.1"
 
 - `std` (default) - Compatibility flag; the standard library is required in every configuration
 - `serde` - Serialization/deserialization support (adds `serde`, `serde_json`, `bincode`)
-- `rayon` - Enables the dependency; algorithms currently execute serially
+- `rayon` - Parallelizes large global boost-factor updates while preserving scalar results
 - `simd` - Enables runtime-dispatched SIMD utilities on supported processors; disabled by default
 
 ```toml
@@ -186,7 +186,7 @@ tm.reset();
 
 ### Encoders
 
-Mokosh includes 38 encoders across multiple domains. See [ENCODERS.md](ENCODERS.md) for comprehensive documentation.
+Mokosh includes 39 encoders across multiple domains. See [ENCODERS.md](ENCODERS.md) for comprehensive documentation.
 
 #### Scalar Encoders
 ```rust
@@ -345,7 +345,7 @@ mokosh/
 │   │   ├── temporal_memory.rs
 │   │   ├── anomaly.rs      # Anomaly & AnomalyLikelihood
 │   │   └── sdr_classifier.rs
-│   ├── encoders/           # 38 encoder implementations
+│   ├── encoders/           # 39 encoder implementations
 │   │   ├── mod.rs
 │   │   ├── base.rs         # Encoder trait
 │   │   ├── scalar.rs, rdse.rs, date.rs, simhash.rs

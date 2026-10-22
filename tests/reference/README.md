@@ -42,3 +42,17 @@ the C++ iterator emits [22,22,23,30]. Mokosh's expected answer is [22,23,30].
 `nonwrapping_reference_duplicate_is_not_reproduced` makes this divergence explicit.
 The wrapped 60-step SP fixture compares normal learning through update iteration
 50, rather than propagating that duplicate into boost statistics.
+
+
+## Extended sequence and core probes
+
+`tm_campaign.cpp` exercises 12 seeds and 300 steps per seed. The compact
+`tm_campaign_d869994.txt` is the Rust-only regression fixture. Use
+`run_campaign.py --reference-root PATH --reference-build PATH` to compile the
+oracle and compare complete graph records at every step, including permanence
+bits, rather than relying only on the compact digests.
+
+`followup_probe.cpp` generates `followup_d869994.txt` for f64 encoders and
+streaming metrics. Compile and link it with the same include/library arguments
+as `htm_core_probe.cpp`; `cargo test --all-features --test followup_parity`
+checks its results.

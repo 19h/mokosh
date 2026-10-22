@@ -1,5 +1,8 @@
 # Mokosh port review
 
+This records the initial pass. See [FOLLOWUP_REVIEW.md](FOLLOWUP_REVIEW.md) for
+the subsequent deeper review, additional corrections and broader validation.
+
 Review baseline: Mokosh `d030a358df4efbea95c5a5f9686064411fad1c64` against local
 htm.core `d86999487036c36c3b242ee46b9ba9b8f566087d`, 2026-10-22.
 The C++ reference checkout was left unchanged. Findings below refer to these

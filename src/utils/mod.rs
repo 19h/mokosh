@@ -4,10 +4,13 @@
 //! the library, including random number generation, topology utilities, and metrics.
 
 mod random;
-mod topology;
 mod sdr_metrics;
 pub mod simd;
+mod topology;
 
 pub use random::Random;
-pub use topology::{Topology, WrappingMode, Neighborhood};
 pub use sdr_metrics::SdrMetrics;
+pub use topology::{Neighborhood, Topology, WrappingMode};
+
+mod metrics;
+pub use metrics::{ActivationFrequency, AttachedMetrics, Metrics, Overlap, Sparsity};

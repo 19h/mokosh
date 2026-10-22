@@ -100,30 +100,30 @@ mod scalar;
 mod simhash;
 
 // Audio encoders
+mod pitch;
 mod spectrogram;
 mod waveform;
-mod pitch;
 
 // Text/NLP encoders
-mod word_embedding;
 mod character;
-mod ngram;
 mod llm_embedding;
+mod ngram;
+mod word_embedding;
 
 // Vision encoders
-mod patch;
 mod color;
 mod edge_orientation;
+mod patch;
 
 // Network encoders
+mod graph_node;
 mod ip_address;
 mod mac_address;
-mod graph_node;
 
 // Biometric encoders
-mod hrv;
-mod ecg;
 mod accelerometer;
+mod ecg;
+mod hrv;
 
 // Categorical encoders
 mod hierarchical_category;
@@ -131,13 +131,13 @@ mod ordinal;
 mod set;
 
 // Financial encoders
-mod price;
 mod currency_pair;
 mod order_book;
+mod price;
 
 // Probabilistic encoders
-mod distribution;
 mod confidence_interval;
+mod distribution;
 
 pub use base::Encoder;
 pub use boolean::{BooleanEncoder, BooleanEncoderParams};
@@ -148,39 +148,41 @@ pub use delta::{DeltaEncoder, DeltaEncoderParams};
 pub use geospatial::{GeospatialEncoder, GeospatialEncoderParams, GpsCoordinate};
 pub use grid::{GridCellEncoder, GridCellEncoderParams};
 pub use log::{LogEncoder, LogEncoderParams};
-pub use multi::{EncoderField, MultiEncoder, MultiEncoderBuilder, VecMultiEncoder, VecMultiEncoderBuilder};
+pub use multi::{
+    EncoderField, MultiEncoder, MultiEncoderBuilder, VecMultiEncoder, VecMultiEncoderBuilder,
+};
 pub use passthrough::{PassThroughEncoder, PassThroughEncoderParams};
 pub use rdse::{RandomDistributedScalarEncoder, Rdse, RdseParams};
 pub use scalar::{ScalarEncoder, ScalarEncoderParams};
 pub use simhash::{SimHashDocumentEncoder, SimHashDocumentEncoderParams};
 
 // Audio encoders
+pub use pitch::{Pitch, PitchEncoder, PitchEncoderParams};
 pub use spectrogram::{SpectrogramEncoder, SpectrogramEncoderParams};
 pub use waveform::{WaveformEncoder, WaveformEncoderParams};
-pub use pitch::{PitchEncoder, PitchEncoderParams, Pitch};
 
 // Text/NLP encoders
-pub use word_embedding::{WordEmbeddingEncoder, WordEmbeddingEncoderParams};
 pub use character::{CharacterEncoder, CharacterEncoderParams};
-pub use ngram::{NGramEncoder, NGramEncoderParams};
 pub use llm_embedding::{
     DimensionStrategy, LlmEmbeddingEncoder, LlmEmbeddingEncoderParams, NormalizationStrategy,
 };
+pub use ngram::{NGramEncoder, NGramEncoderParams};
+pub use word_embedding::{WordEmbeddingEncoder, WordEmbeddingEncoderParams};
 
 // Vision encoders
-pub use patch::{PatchEncoder, PatchEncoderParams, ImagePatch};
 pub use color::{ColorEncoder, ColorEncoderParams, HsvColor, RgbColor};
 pub use edge_orientation::{EdgeOrientationEncoder, EdgeOrientationEncoderParams, OrientedEdge};
+pub use patch::{ImagePatch, PatchEncoder, PatchEncoderParams};
 
 // Network encoders
+pub use graph_node::{GraphNode, GraphNodeEncoder, GraphNodeEncoderParams};
 pub use ip_address::{IpAddressEncoder, IpAddressEncoderParams};
-pub use mac_address::{MacAddressEncoder, MacAddressEncoderParams, MacAddress};
-pub use graph_node::{GraphNodeEncoder, GraphNodeEncoderParams, GraphNode};
+pub use mac_address::{MacAddress, MacAddressEncoder, MacAddressEncoderParams};
 
 // Biometric encoders
-pub use hrv::{HrvEncoder, HrvEncoderParams, HrvMetrics};
-pub use ecg::{EcgEncoder, EcgEncoderParams, EcgStats};
 pub use accelerometer::{AccelerometerEncoder, AccelerometerEncoderParams, AccelerometerReading};
+pub use ecg::{EcgEncoder, EcgEncoderParams, EcgStats};
+pub use hrv::{HrvEncoder, HrvEncoderParams, HrvMetrics};
 
 // Categorical encoders
 pub use hierarchical_category::{HierarchicalCategoryEncoder, HierarchicalCategoryEncoderParams};
@@ -188,10 +190,15 @@ pub use ordinal::{OrdinalEncoder, OrdinalEncoderParams};
 pub use set::{SetEncoder, SetEncoderParams};
 
 // Financial encoders
-pub use price::{PriceEncoder, PriceEncoderParams, PriceData};
-pub use currency_pair::{CurrencyPairEncoder, CurrencyPairEncoderParams, CurrencyPair};
-pub use order_book::{OrderBookEncoder, OrderBookEncoderParams, OrderBook, PriceLevel};
+pub use currency_pair::{CurrencyPair, CurrencyPairEncoder, CurrencyPairEncoderParams};
+pub use order_book::{OrderBook, OrderBookEncoder, OrderBookEncoderParams, PriceLevel};
+pub use price::{PriceData, PriceEncoder, PriceEncoderParams};
 
 // Probabilistic encoders
-pub use distribution::{DistributionEncoder, DistributionEncoderParams, Distribution};
-pub use confidence_interval::{ConfidenceIntervalEncoder, ConfidenceIntervalEncoderParams, ConfidenceInterval};
+pub use confidence_interval::{
+    ConfidenceInterval, ConfidenceIntervalEncoder, ConfidenceIntervalEncoderParams,
+};
+pub use distribution::{Distribution, DistributionEncoder, DistributionEncoderParams};
+
+mod scalar64;
+pub use scalar64::{ScalarEncoder64, ScalarEncoderParams64};

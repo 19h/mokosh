@@ -1,6 +1,6 @@
 # Mokosh Encoders Reference
 
-Encoders convert raw data into Sparse Distributed Representations (SDRs) suitable for HTM processing. This document provides comprehensive documentation for all 38 encoders in Mokosh.
+Encoders convert raw data into Sparse Distributed Representations (SDRs) suitable for HTM processing. This document provides comprehensive documentation for all 39 encoders in Mokosh.
 
 ## Table of Contents
 
@@ -43,6 +43,15 @@ Common patterns:
 ---
 
 ## Scalar Encoders
+
+### ScalarEncoder64
+
+`ScalarEncoder64` preserves f64 input, bounds and resolution. Its
+`ScalarEncoderParams64` supports size, radius, resolution and category modes,
+with the same mutually exclusive configuration rules as htm.core. Use it when
+f32 would merge distinct input values. The existing `ScalarEncoder` API remains
+available for compatibility. RDSE also exposes `encode_f64` and
+`encode_f64_to_sdr` for f64 input without narrowing.
 
 ### ScalarEncoder
 
